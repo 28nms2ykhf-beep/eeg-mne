@@ -1,0 +1,563 @@
+import os
+import glob
+import mne
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+
+
+PATIENT_IDS = []
+
+BASE_PATH = "/home/sv25/Desktop/eeg_files+annotations"
+SESSIONS_TO_PROCESS = ["ses-1", "ses-2", "ses-3"]
+OUTPUT_BASE_DIR = "/home/sv25/Desktop/eeg_epochs_output"
+
+
+
+#### setting up the bipolar montage
+
+def create_longitudinal_bipolar_montage(raw):
+
+    bipolar_pairs = [
+        ('Fp1', 'F7', 'Fp1-F7'),            # left temporal chain
+        ('F7', 'T3', 'F7-T3'),
+        ('T3', 'T5', 'T3-T5'),
+        ('T5', 'O1', 'T5-O1'),
+        ('Fp2', 'F8', 'Fp2-F8'),            # right temporal chain
+        ('F8', 'T4', 'F8-T4'),
+        ('T4', 'T6', 'T4-T6'),
+        ('T6', 'O2', 'T6-O2'),
+        ('Fp1', 'F3', 'Fp1-F3'),            # left parasagittal
+        ('F3', 'C3', 'F3-C3'),
+        ('C3', 'P3', 'C3-P3'),
+        ('P3', 'O1', 'P3-O1'),
+        ('Fp2', 'F4', 'Fp2-F4'),            # right parasagittal
+        ('F4', 'C4', 'F4-C4'),
+        ('C4', 'P4', 'C4-P4'),
+        ('P4', 'O2', 'P4-O2'),
+        ('Fz', 'Cz', 'Fz-Cz'),              # mid-chain
+        ('Cz', 'Pz', 'Cz-Pz'),
+    ]
+
+    bipolar_data = []
+    bipolar_ch_names = []
+    sfreq = raw.info['sfreq']
+
+    for ch1, ch2, ch_name in bipolar_pairs:
+        if ch1 in raw.ch_names and ch2 in raw.ch_names:
+            data1 = raw.get_data(picks=ch1)[0]
+            data2 = raw.get_data(picks=ch2)[0]
+            bipolar_data.append(data1 - data2)
+            bipolar_ch_names.append(ch_name)
+
+    info = mne.create_info(bipolar_ch_names, sfreq, ch_types='eeg')
+    bipolar_raw = mne.io.RawArray(np.array(bipolar_data), info)
+    return bipolar_raw
+
+
+def extract_csv_annotations(csv_path):
+    """extract annotations from csv file"""
+    try:
+        df = pd.read_csv(csv_path)
+
+        events = []
+        start_recording_time = None
+        stop_recording_time = None
+
+        for idx, row in df.dropna(subset=['Text', 'Stamp']).iterrows():
+            text = str(row['Text']).strip()
+            stamp = float(row['Stamp'])/sfreq
+
+            skip_texts = ['montage:', 'review', 'movement',
+                          'eye opened', 'eye closed','video recording on,', 'video recording off,'
+                          'video recording fault,', 'started analyzer - xlevent / ecg，','started analyzer - data trends，',
+                          'video system error', 'started analyzer - persyst，',
+                          'analyzer info - persyst,','arouses','chewing','arousal',
+                          'patient event clip', 'headbox reconnected','breakout box *****.',
+                          'recording analyzer - xlevent / ecg,', 'recording analyzer - data trends,',
+                          'recording analyzer - persyst,', 'off camera,', 'not on camera,']
+
+            if any(skip in text.lower() for skip in skip_texts):
+                continue
+
+            if 'start recording' in text.lower():
+                start_recording_time = stamp
+                continue
+
+            elif 'stop recording' in text.lower():
+                stop_recording_time = stamp
+                continue
+
+            if text.isdigit() or len(text) <= 10:
+                duration = 0.0
+                if 'Duration' in df.columns and not pd.isna(row.get('Duration')):
+                     duration = float(row['Duration'])
+                events.append({
+                    'onset': stamp-(1407/sfreq),
+                    'duration': duration,
+                    'description': text
+                })
+
+        if events:
+            print(f'Final annotation is at: {events[-1]}')
+        else:
+            print("No numeric annotations found in csv")
+
+        if start_recording_time is not None:
+            print(f"Found start recording time: {start_recording_time:.3f} seconds")
+        else:
+            print("Warning: No start recording time found in CSV")
+
+        if stop_recording_time is not None:
+            print(f"Found stop recording time: {stop_recording_time:.3f} seconds")
+        else:
+            print("Warning: No stop recording time found in CSV")
+
+        if events:
+            onsets = [e['onset'] for e in events]
+            durations = [e['duration'] for e in events]
+            descriptions = [e['description'] for e in events]
+
+            annotations = mne.Annotations(
+                onsets,
+                durations,
+                descriptions
+            )
+        else:
+            annotations = mne.Annotations([], [], [])
+
+        return annotations, start_recording_time, stop_recording_time
+
+    except Exception as e:
+        print(f"Error on CSV extraction: {e}")
+        return mne.Annotations([], [], []), None, None
+
+
+
+
+def process_eeg_session(edf_path, csv_path, output_dir, target_sfreq=256):
+    """process a single session and resample to target frequency"""
+
+    print(f"\n{'='*60}")
+    print(f"Loading EDF file...")
+    raw = mne.io.read_raw_edf(edf_path, preload=False)
+
+    actual_sfreq = raw.info['sfreq']
+    print(f"Actual sampling frequency: {actual_sfreq} Hz")
+    print(f"Target sampling frequency: {target_sfreq} Hz")
+    print(f"Data sample points: {len(raw.times)}")
+    print(f"Sample length: {raw.times[-1]:.2f} s")
+
+    # check if resampling is needed
+    need_resample = abs(actual_sfreq - target_sfreq) > 0.01
+
+
+
+    # extract csv file
+    if csv_path:
+        print(f"Extracting CSV annotations...")
+        csv_annotations, start_time, stop_time = extract_csv_annotations(csv_path)
+        raw.set_annotations(csv_annotations)
+
+        # match the eeg-annotations time
+        if start_time is not None:
+            csv_offset = start_time
+        else:
+            csv_offset = 0.0
+
+        start_time = start_time - csv_offset if start_time is not None else None
+        stop_time = stop_time - csv_offset if stop_time is not None else None
+    else:
+        csv_annotations = None
+        start_time = None
+        stop_time = None
+
+
+    if start_time is None:
+        start_time = 0
+        print("Using default start_time = 0")
+    if stop_time is None:
+        end_time = raw.times[-1]
+        print(f"Using default end_time = {end_time:.2f}")
+    else:
+        end_time = min(stop_time, raw.times[-1])
+
+    print(f"Using start_time: {start_time:.3f} seconds")
+    print(f"Using end_time: {end_time:.3f} seconds")
+
+    raw_cropped = raw.copy()
+    raw_cropped.crop(tmin=start_time, tmax=end_time)
+
+    artifacts_to_drop = ['OSAT', 'PR']
+    existing_artifacts = [ch for ch in artifacts_to_drop if ch in raw_cropped.ch_names]
+    if existing_artifacts:
+        print(f"Dropping artifact channels: {existing_artifacts}")
+        raw_cropped.drop_channels(existing_artifacts)
+
+    print(f"Remaining channels: {len(raw_cropped.ch_names)}")
+
+
+###### setting up high and lo pass filters
+    print(f"Applying filters")
+    raw_ref = raw_cropped.copy()
+    raw_ref.load_data()
+
+    raw_filter = raw_ref.copy()
+    raw_filter.filter(l_freq=0.3, h_freq=70)
+    raw_filter.notch_filter(freqs=60)
+
+    raw_recons = raw_filter.copy()
+    raw_recons.filter(l_freq=0.3, h_freq=70)
+    raw_recons.notch_filter(freqs=60)
+
+
+##### making epochs
+    print(f"Converting annotations to epochs...")
+    skip_words = ['montage:', 'review', 'movement', 'eye opened', 'eye closed']
+    selected_annots = []
+    for ann in raw_recons.annotations:
+        desc = ann['description'].lower()
+        if not any(skip in desc for skip in skip_words):
+            selected_annots.append(ann)
+
+    print(f"Found {len(selected_annots)} valid annotations")
+
+    sfreq = raw_recons.info['sfreq']
+    events_list = []
+    valid_annotations = []
+
+    for ann in selected_annots:
+        onset_sec = ann['onset']
+        if 8.0 <= onset_sec <= (raw_recons.times[-1] - 8.0):
+            sample_point = int(onset_sec * sfreq)
+            events_list.append([sample_point, 0, 1])
+            valid_annotations.append(ann)
+
+    if not events_list:
+        print("    No valid events within data range")
+        return False
+
+    events_array = np.array(events_list)
+    print(f"    Converted to {len(events_array)} events")
+
+
+############### create epochs
+
+    epochs = mne.Epochs(raw_recons,
+                        events_array,
+                        event_id=1,
+                        tmin=-8.0,
+                        tmax=8.0,
+                        event_repeated='merge',
+                        baseline=None,
+                        preload=True,
+                        verbose=False)
+
+    print(f"Created {len(epochs)} epochs at {actual_sfreq} Hz")
+
+    if need_resample:
+        print(f"Resampling from {actual_sfreq} Hz to {target_sfreq} Hz...")
+        epochs_resampled = epochs.copy().resample(target_sfreq, npad='auto')
+        epochs_to_save = epochs_resampled
+
+    else:
+        epochs_to_save = epochs
+        print(f"No resampling needed (already at {target_sfreq} Hz)")
+
+
+
+    expected_length = int(16 * target_sfreq)
+    saved_count = 0
+    for i in range(len(epochs_to_save)):
+        single_epoch = epochs_to_save[i]
+
+        if i < len(valid_annotations):
+            annotation_desc = valid_annotations[i]['description']
+        else:
+            annotation_desc = f"unknown_{i}"
+
+        epoch_data = single_epoch.get_data()
+
+        if epoch_data.shape[0] > 0:
+            data = epoch_data[0]
+            n_channels = 18
+            n_times = expected_length
+
+            if data.shape[0] != n_channels:
+                if data.shape[0] > n_channels:
+                    data = data[:n_channels, :]
+
+                else:
+                    padding = np.zeros((n_channels - data.shape[0], data.shape[1]))
+                    data = np.vstack([data, padding])
+
+
+            if data.shape[1] != n_times:
+                if data.shape[1] > n_times:
+                    excess = data.shape[1] - n_times
+                    start_idx = excess // 2
+                    end_idx = start_idx + n_times
+                    data = data[:, start_idx:end_idx]
+                else:
+                    padding_needed = n_times - data.shape[1]
+                    pad_left = padding_needed // 2
+                    pad_right = padding_needed - pad_left
+                    data = np.pad(data, ((0, 0), (pad_left, pad_right)),
+                                 mode='constant', constant_values=0)
+
+
+            tensor = torch.FloatTensor(data).unsqueeze(0)  # [1, 18, 4096]
+
+            safe_desc = annotation_desc.replace('/', '_').replace('\\', '_')
+            pt_filename = f"epoch_{i + 1:05d}_{safe_desc}_{target_sfreq}Hz.pt"
+            pt_filepath = os.path.join(output_dir, pt_filename)
+
+            torch.save(tensor, pt_filepath)
+            saved_count += 1
+
+            if (i + 1) % 20 == 0:
+                print(f"    Saved {i + 1}/{len(epochs_to_save)} PT files")
+
+        else:
+            print(f"    Warning: Epoch {i + 1} has no data")
+
+    print(f"    ✓ Saved {saved_count} PT files to {output_dir}")
+
+
+
+
+
+
+##### clear RAM
+
+    del raw, raw_cropped, raw_ref, raw_filter, raw_recons, epochs
+    if need_resample:
+        del epochs_resampled
+    import gc
+    gc.collect()
+
+    return True
+
+
+#######################################################################################################################
+
+def find_session_files(base_path, patient_id, session):
+    """check edf and csv file for patient id"""
+    eeg_folder = os.path.join(base_path, patient_id, session, "eeg")
+
+    if not os.path.exists(eeg_folder):
+        print(f"Folder not found: {eeg_folder}")
+        return None, None, None
+
+    edf_files = glob.glob(os.path.join(eeg_folder, "eeg.edf"))
+
+
+    csv_patterns = [
+        os.path.join(eeg_folder, "annotations.csv"),
+        os.path.join(eeg_folder, ".csv")
+    ]
+
+    csv_files = []
+    for pattern in csv_patterns:
+        csv_files.extend(glob.glob(pattern))
+        if csv_files:
+            break
+
+    if not edf_files:
+        print(f"No EDF files found in {eeg_folder}")
+        return None, None, None
+
+    if not csv_files:
+        print(f"No CSV files found in {eeg_folder}, will proceed without annotations")
+        return eeg_folder, edf_files[0], None
+
+    print(f"Found: {os.path.basename(edf_files[0])}")
+    print(f"Found: {os.path.basename(csv_files[0])}")
+
+    return eeg_folder, edf_files[0], csv_files[0]
+
+
+
+
+def process_single_session(patient_id, session, edf_path, csv_path, output_base_dir):
+    """process a single session"""
+
+
+    patient_output_dir = os.path.join(output_base_dir, f"patient_{patient_id}")
+    session_output_dir = os.path.join(patient_output_dir, session)
+    os.makedirs(session_output_dir, exist_ok=True)
+
+    print(f"Output directory: {session_output_dir}")
+
+    try:
+        # process eeg data
+        success = process_eeg_session(edf_path, csv_path, session_output_dir)
+
+        if success:
+            print(f"Processing completed successfully")
+            # 保存处理摘要
+            save_processing_summary(patient_id, session, session_output_dir, "success")
+            return True
+        else:
+            print(f"Processing failed")
+            save_processing_summary(patient_id, session, session_output_dir, "failed")
+            return False
+
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        save_processing_summary(patient_id, session, session_output_dir, f"error: {str(e)}")
+        return False
+
+
+
+def save_processing_summary(patient_id, session, output_dir, status):
+    """save processing summary"""
+    summary_file = os.path.join(output_dir, "processing_summary.txt")
+    with open(summary_file, 'w') as f:
+        f.write(f"Patient ID: {patient_id}\n")
+        f.write(f"Session: {session}\n")
+        f.write(f"Processing Status: {status}\n")
+        f.write(f"Processing Time: {pd.Timestamp.now()}\n")
+        f.write(f"Output Directory: {output_dir}\n")
+
+
+def batch_process_epochs():
+    """Process all the sessions for one patient in batch"""
+
+    print("\n" + "=" * 70)
+    print("Starting Batch EEG Processing")
+    print("=" * 70)
+
+    total_patients = len(PATIENT_IDS)
+    total_sessions = len(SESSIONS_TO_PROCESS)
+
+    print(f"Total patients to process: {total_patients}")
+    print(f"Sessions per patient: {total_sessions}")
+    print(f"Total sessions: {total_patients * total_sessions}")
+    print(f"Output structure: {OUTPUT_BASE_DIR}/patient_XXXX/ses-X/")
+    print()
+
+
+    successful_sessions = 0
+    failed_sessions = 0
+    skipped_sessions = 0
+
+
+    for patient_idx, patient_id in enumerate(PATIENT_IDS, 1):
+        print(f"\n{'#' * 60}")
+        print(f"PATIENT {patient_idx}/{total_patients}: {patient_id}")
+        print(f"{'#' * 60}")
+
+        patient_success = 0
+        patient_failed = 0
+
+        for session_idx, session in enumerate(SESSIONS_TO_PROCESS, 1):
+            print(f"\n [{patient_idx}.{session_idx}] Processing: {session}")
+
+            # search file
+            eeg_folder, edf_path, csv_path = find_session_files(
+                BASE_PATH, patient_id, session
+            )
+
+            if edf_path is None:
+                print(f"Skipping {patient_id}/{session} (no EDF file)")
+                patient_failed += 1
+                skipped_sessions += 1
+                continue
+
+
+##### process this session
+            success = process_single_session(
+                patient_id=patient_id,
+                session=session,
+                edf_path=edf_path,
+                csv_path=csv_path,
+                output_base_dir=OUTPUT_BASE_DIR
+            )
+
+            if success:
+                patient_success += 1
+                successful_sessions += 1
+            else:
+                patient_failed += 1
+                failed_sessions += 1
+
+
+            import time
+            time.sleep(0.5)
+
+        # processed patient result
+        print(f"\n  {'=' * 40}")
+        print(f" Patient {patient_id} Summary:")
+        print(f" Successful: {patient_success}/{total_sessions}")
+        print(f" Failed/Skipped: {patient_failed}/{total_sessions}")
+
+
+
+
+
+################################################# Final Report for the processing
+
+
+    print(f"\n{'='*70}")
+    print("Batch Processing Complete!")
+    print(f"{'='*70}")
+    print(f"Total Sessions: {total_patients * total_sessions}")
+    print(f"Successful: {successful_sessions}")
+    print(f"Failed: {failed_sessions}")
+    print(f"Skipped: {skipped_sessions}")
+
+############## I hope print this could be helpful for the data structure
+    print(f"\nOutput directory structure:")
+    print(f"  {OUTPUT_BASE_DIR}/")
+    print(f"    ├── patient_XXXX/")
+    print(f"    │   ├── ses-1/")
+    print(f"    │   ├── ses-2/")
+    print(f"    │   └── ses-3/")
+    print(f"    └── processing_log.txt")
+
+
+
+    # save
+    log_path = os.path.join(OUTPUT_BASE_DIR, "processing_log.txt")
+    with open(log_path, "w") as f:
+        f.write(f"Processing completed at: {pd.Timestamp.now()}\n")
+        f.write(f"Patients processed: {PATIENT_IDS}\n")
+        f.write(f"Sessions per patient: {SESSIONS_TO_PROCESS}\n")
+        f.write(f"Successful sessions: {successful_sessions}\n")
+        f.write(f"Failed sessions: {failed_sessions}\n")
+        f.write(f"Skipped sessions: {skipped_sessions}\n")
+        f.write(f"\nPatient details:\n")
+
+
+        for patient_id in PATIENT_IDS:
+            patient_dir = os.path.join(OUTPUT_BASE_DIR, f"patient_{patient_id}")
+            if os.path.exists(patient_dir):
+                f.write(f"\nPatient {patient_id}:\n")
+                for session in SESSIONS_TO_PROCESS:
+                    session_dir = os.path.join(patient_dir, session)
+                    if os.path.exists(session_dir):
+                        summary_file = os.path.join(session_dir, "processing_summary.txt")
+                        if os.path.exists(summary_file):
+                            with open(summary_file, 'r') as sf:
+                                f.write(f"  {session}: {sf.read()}")
+
+    print(f"\nDetailed log saved to: {log_path}")
+
+    return successful_sessions, failed_sessions, skipped_sessions
+
+
+
+if __name__ == "__main__":
+    os.makedirs(OUTPUT_BASE_DIR, exist_ok=True)
+
+    successful, failed, skipped = batch_process_epochs()
+
+    print(f"\nProcessing complete. Check the output directory:")
+    print(f"  {OUTPUT_BASE_DIR}")
+
