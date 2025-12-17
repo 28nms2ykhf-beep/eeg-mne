@@ -1,0 +1,84 @@
+
+        
+
+        print(f"\n extract annotations...")
+        event_count = 0
+        
+        for idx, row in df.dropna(subset=['Text', 'Stamp']).iterrows():
+            text = str(row['Text']).strip()
+            original_text = text
+            text_lower = text.lower()
+            stamp = float(row['Stamp'])
+
+            if 'start recording' in text_lower or 'stop recording' in text_lower:
+                continue
+            
+            skip_texts = [
+                'montage:', 'review', 'movement',
+                'eye opened', 'eye closed', 'video recording',
+                'video system', 'analyzer', 'camera',
+                'arouses', 'chewing', 'arousal', 'patient event',
+                'headbox', 'breakout', 'off camera', 'not on camera'
+            ]
+            
+            should_skip = False
+            for skip in skip_texts:
+                if skip in text_lower:
+                    should_skip = True
+                    break
+            
+            if should_skip:
+                continue
+            
+            is_event = False
+            
+            if text.isdigit():
+                is_event = True
+            
+            elif len(text) <= 10:
+                non_events = ['start', 'stop', 'on', 'off', 'error', 'fault']
+                if not any(non_event in text_lower for non_event in non_events):
+                    is_event = True
+            
+            if is_event:
+                duration = 0.0
+                if 'Duration' in df.columns and not pd.isna(row.get('Duration')):
+                    duration = float(row['Duration'])
+                
+
+                corrected_onset = (stamp - start_recording_stamp) / sfreq
+                
+                print(f" {event_count+1:03d}: '{original_text}' "
+                      f"@ Stamp={stamp}, 相对时间={corrected_onset:.3f}s")
+                
+                events.append({
+                    'onset': corrected_onset,
+                    'duration': duration,
+                    'description': original_text
+                })
+                event_count += 1
+        
+        print(f"\n stats:")
+        print(f"  annotations found: {len(events)}")
+        
+        if events:
+            onsets = [e['onset'] for e in events]
+            durations = [e['duration'] for e in events]
+            descriptions = [e['description'] for e in events]
+            
+            annotations = mne.Annotations(onsets, durations, descriptions)
+            
+            print(f"  first annotation: '{events[0]['description']}' @ {events[0]['onset']:.3f}s")
+            print(f"  last annotation: '{events[-1]['description']}' @ {events[-1]['onset']:.3f}s")
+            print(f" sucessfully created {len(annotations)} annotations")
+            
+            return annotations, start_recording_stamp, start_recording_time, stop_recording_time
+        else:
+            print(f"haven't found any event")
+            return mne.Annotations([], [], []), start_recording_stamp, start_recording_time, stop_recording_time
+            
+    except Exception as e:
+        print(f"\n❌ CSV process error: {e}")
+        import traceback
+        traceback.print_exc()
+        return mne.Annotations([], [], []), None, None, None
