@@ -11,10 +11,15 @@ from datetime import datetime
 
 
 
-PATIENT_IDS = []
+PATIENT_IDS = ["150017287"]
 
 BASE_PATH = "/home/sv25/Desktop/eeg_files+annotations"
-SESSIONS_TO_PROCESS = ["ses-1", "ses-2", "ses-3"]
+SESSIONS_TO_PROCESS = ["ses-1", "ses-2", "ses-3", "ses-4", "ses-5", 
+                       "ses-6", "ses-8", "ses-9", "ses-11", 
+                       "ses-12", "ses-13", "ses-14", "ses-15", 
+                       "ses-16", "ses-17", "ses-18", "ses-19", 
+                       "ses-20", "ses-21", "ses-23", "ses-26",
+                       "ses-27", "ses-28"]
 OUTPUT_BASE_DIR = "/home/sv25/Desktop/eeg_epochs_output"
 
 
@@ -48,94 +53,142 @@ def create_longitudinal_bipolar_montage(raw):
     bipolar_ch_names = []
     sfreq = raw.info['sfreq']
 
-    for ch1, ch2, ch_name in bipolar_pairs:
+    for ch1, ch2, ch_names in bipolar_pairs:
         if ch1 in raw.ch_names and ch2 in raw.ch_names:
             data1 = raw.get_data(picks=ch1)[0]
             data2 = raw.get_data(picks=ch2)[0]
             bipolar_data.append(data1 - data2)
-            bipolar_ch_names.append(ch_name)
+            bipolar_ch_names.append(ch_names)
 
     info = mne.create_info(bipolar_ch_names, sfreq, ch_types='eeg')
     bipolar_raw = mne.io.RawArray(np.array(bipolar_data), info)
+
+    if raw.info['meas_date'] is not None:
+        bipolar_raw.set_meas_date(raw.info['meas_date'])
     return bipolar_raw
 
 
-def extract_csv_annotations(csv_path):
+def extract_csv_annotations(csv_path, sfreq):
     """extract annotations from csv file"""
     try:
         df = pd.read_csv(csv_path)
-
         events = []
+        start_recording_stamp = None
         start_recording_time = None
         stop_recording_time = None
 
+        print(f"Searching for recording markers in CSV: {os.path.basename(csv_path)}")
+
+        found_start = False
+
+        for idx, row in df.dropna(subset=['Text', 'Stamp']).iterrows():
+            text = str(row['Text']).strip().lower()
+            stamp = float(row['Stamp'])
+
+            if 'start recording' in text or 'recording' in text:
+                start_recording_stamp = stamp
+                start_recording_time = start_recording_stamp / sfreq
+                print(f" Found start recording time: stamp={start_recording_stamp}, Time ={start_recording_time:.3f}s")
+                found_start = True
+                break
+            
+        if not found_start:
+            print(f"no start recording in CSV")
+            if 'Stamp' in df.columns:
+                min_stamp = df['Stamp'].min()
+                start_recording_stamp = min_stamp
+                start_recording_time = start_recording_stamp/sfreq
+                print(f"using earliest stamp: {start_recording_stamp}-> {start_recording_time:.3f}")
+
+            else:
+                start_recording_stamp = 0
+                start_recording_time = 0
+                print(f"using default 0")
+
+
+
+        print(f"\n extract annotations...")
+        event_count = 0
+        
         for idx, row in df.dropna(subset=['Text', 'Stamp']).iterrows():
             text = str(row['Text']).strip()
-            stamp = float(row['Stamp'])/sfreq
+            original_text = text
+            text_lower = text.lower()
+            stamp = float(row['Stamp'])
 
+            if 'start recording' in text_lower or 'stop recording' in text_lower:
+                continue
+            
             skip_texts = ['montage:', 'review', 'movement',
                           'eye opened', 'eye closed','video recording on,', 'video recording off,'
                           'video recording fault,', 'started analyzer - xlevent / ecg，','started analyzer - data trends，',
                           'video system error', 'started analyzer - persyst，',
                           'analyzer info - persyst,','arouses','chewing','arousal',
                           'patient event clip', 'headbox reconnected','breakout box *****.',
-                          'recording analyzer - xlevent / ecg,', 'recording analyzer - data trends,',
-                          'recording analyzer - persyst,', 'off camera,', 'not on camera,']
-
-            if any(skip in text.lower() for skip in skip_texts):
+                          'recording analyzer - persyst,', 'off camera,', 'not on camera,',' recording analyzer - data trends']
+            
+            should_skip = False
+            for skip in skip_texts:
+                if skip in text_lower:
+                    should_skip = True
+                    break
+            
+            if should_skip:
                 continue
-
-            if 'start recording' in text.lower():
-                start_recording_time = stamp
-                continue
-
-            elif 'stop recording' in text.lower():
-                stop_recording_time = stamp
-                continue
-
-            if text.isdigit() or len(text) <= 10:
+            
+            is_event = False
+            
+            if text.isdigit():
+                is_event = True
+            
+            elif len(text) <= 10:
+                non_events = ['start', 'stop', 'on', 'off', 'error', 'fault']
+                if not any(non_event in text_lower for non_event in non_events):
+                    is_event = True
+            
+            if is_event:
                 duration = 0.0
                 if 'Duration' in df.columns and not pd.isna(row.get('Duration')):
-                     duration = float(row['Duration'])
+                    duration = float(row['Duration'])
+                
+
+                corrected_onset = (stamp - start_recording_stamp) / sfreq
+                
+                print(f" {event_count+1:03d}: '{original_text}' "
+                      f"@ Stamp={stamp}, relative time={corrected_onset:.3f}s")
+                
                 events.append({
-                    'onset': stamp-(1407/sfreq),
+                    'onset': corrected_onset,
                     'duration': duration,
-                    'description': text
+                    'description': original_text
                 })
-
-        if events:
-            print(f'Final annotation is at: {events[-1]}')
-        else:
-            print("No numeric annotations found in csv")
-
-        if start_recording_time is not None:
-            print(f"Found start recording time: {start_recording_time:.3f} seconds")
-        else:
-            print("Warning: No start recording time found in CSV")
-
-        if stop_recording_time is not None:
-            print(f"Found stop recording time: {stop_recording_time:.3f} seconds")
-        else:
-            print("Warning: No stop recording time found in CSV")
-
+                event_count += 1
+        
+        print(f"\n stats:")
+        print(f"  annotations found: {len(events)}")
+        
         if events:
             onsets = [e['onset'] for e in events]
             durations = [e['duration'] for e in events]
             descriptions = [e['description'] for e in events]
-
-            annotations = mne.Annotations(
-                onsets,
-                durations,
-                descriptions
-            )
+            
+            annotations = mne.Annotations(onsets, durations, descriptions)
+            
+            print(f"  first annotation: '{events[0]['description']}' @ {events[0]['onset']:.3f}s")
+            print(f"  last annotation: '{events[-1]['description']}' @ {events[-1]['onset']:.3f}s")
+            print(f" sucessfully created {len(annotations)} annotations")
+            
+            return annotations, start_recording_stamp, start_recording_time, stop_recording_time
         else:
-            annotations = mne.Annotations([], [], [])
-
-        return annotations, start_recording_time, stop_recording_time
-
+            print(f"haven't found any event")
+            return mne.Annotations([], [], []), start_recording_stamp, start_recording_time, stop_recording_time
+            
     except Exception as e:
-        print(f"Error on CSV extraction: {e}")
-        return mne.Annotations([], [], []), None, None
+        print(f"\n CSV process error: {e}")
+        import traceback
+        traceback.print_exc()
+        return mne.Annotations([], [], []), None, None, None
+
 
 
 
@@ -144,6 +197,8 @@ def process_eeg_session(edf_path, csv_path, output_dir, target_sfreq=256):
     """process a single session and resample to target frequency"""
 
     print(f"\n{'='*60}")
+
+
     print(f"Loading EDF file...")
     raw = mne.io.read_raw_edf(edf_path, preload=False)
 
@@ -161,8 +216,12 @@ def process_eeg_session(edf_path, csv_path, output_dir, target_sfreq=256):
     # extract csv file
     if csv_path:
         print(f"Extracting CSV annotations...")
-        csv_annotations, start_time, stop_time = extract_csv_annotations(csv_path)
-        raw.set_annotations(csv_annotations)
+        csv_annotations, start_recording_stamp, start_time, stop_time = extract_csv_annotations(csv_path, actual_sfreq)
+
+        if csv_annotations:
+            raw.set_annotations(csv_annotations)
+            print(f"loaded{csv_annotations} annotations from CSV")
+
 
         # match the eeg-annotations time
         if start_time is not None:
@@ -212,8 +271,14 @@ def process_eeg_session(edf_path, csv_path, output_dir, target_sfreq=256):
     raw_filter.notch_filter(freqs=60)
 
     raw_recons = raw_filter.copy()
-    raw_recons.filter(l_freq=0.3, h_freq=70)
-    raw_recons.notch_filter(freqs=60)
+    raw_recons = create_longitudinal_bipolar_montage(raw_recons)
+    
+    if raw_filter.annotations:
+        raw_recons.set_annotations(raw_filter.annotations)
+
+    print(f" Bipolar montage applied: {len(raw_recons.ch_names)} channels")
+    print(f"Channel names:{raw_recons.ch_names}")
+    print(f"Converting annotations to epochs...")
 
 
 ##### making epochs
@@ -320,16 +385,13 @@ def process_eeg_session(edf_path, csv_path, output_dir, target_sfreq=256):
             torch.save(tensor, pt_filepath)
             saved_count += 1
 
-            if (i + 1) % 20 == 0:
-                print(f"    Saved {i + 1}/{len(epochs_to_save)} PT files")
+            if (i + 1) % 5 == 0:
+                print(f"Saved {i + 1}/{len(epochs_to_save)} PT files")
 
         else:
-            print(f"    Warning: Epoch {i + 1} has no data")
+            print(f"Warning: Epoch {i + 1} has no data")
 
-    print(f"    ✓ Saved {saved_count} PT files to {output_dir}")
-
-
-
+    print(f"Saved {saved_count} PT files to {output_dir}")
 
 
 
@@ -340,11 +402,9 @@ def process_eeg_session(edf_path, csv_path, output_dir, target_sfreq=256):
         del epochs_resampled
     import gc
     gc.collect()
-
     return True
 
 
-#######################################################################################################################
 
 def find_session_files(base_path, patient_id, session):
     """check edf and csv file for patient id"""
@@ -354,12 +414,12 @@ def find_session_files(base_path, patient_id, session):
         print(f"Folder not found: {eeg_folder}")
         return None, None, None
 
-    edf_files = glob.glob(os.path.join(eeg_folder, "eeg.edf"))
+    edf_files = glob.glob(os.path.join(eeg_folder, "*.edf"))
 
 
     csv_patterns = [
-        os.path.join(eeg_folder, "annotations.csv"),
-        os.path.join(eeg_folder, ".csv")
+        os.path.join(eeg_folder, "*annotations*.csv"),
+        os.path.join(eeg_folder, "*.csv")
     ]
 
     csv_files = []
@@ -390,9 +450,21 @@ def process_single_session(patient_id, session, edf_path, csv_path, output_base_
 
     patient_output_dir = os.path.join(output_base_dir, f"patient_{patient_id}")
     session_output_dir = os.path.join(patient_output_dir, session)
+    
+    # testing directory
     os.makedirs(session_output_dir, exist_ok=True)
-
     print(f"Output directory: {session_output_dir}")
+
+
+    test_file = os.path.join(session_output_dir, "test_write_txt")
+    try: 
+        with open(test_file, 'w') as f:
+            f.write("test")
+        os.remove(test_file)
+
+    except Exception as e:
+        print(f" canmot write to {session_output_dir}:{e}")
+        return False
 
     try:
         # process eeg data
@@ -400,7 +472,7 @@ def process_single_session(patient_id, session, edf_path, csv_path, output_base_
 
         if success:
             print(f"Processing completed successfully")
-            # 保存处理摘要
+
             save_processing_summary(patient_id, session, session_output_dir, "success")
             return True
         else:
@@ -560,4 +632,5 @@ if __name__ == "__main__":
 
     print(f"\nProcessing complete. Check the output directory:")
     print(f"  {OUTPUT_BASE_DIR}")
+
 
