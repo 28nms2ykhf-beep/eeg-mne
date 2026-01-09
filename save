@@ -1,0 +1,112 @@
+    expected_length = int(16 * target_sfreq)
+    
+    # ============== 新增：准备批量数据 ==============
+    print(f"Preparing {len(epochs_to_save)} epochs for batch processing...")
+    
+    all_epoch_data = []
+    all_annotation_descs = []
+    
+    # 一次性提取所有需要的数据到内存
+    for i in range(len(epochs_to_save)):
+        single_epoch = epochs_to_save[i]
+        
+        if i < len(valid_annotations):
+            annotation_desc = valid_annotations[i]['description']
+        else:
+            annotation_desc = f"unknown_{i}"
+        
+        epoch_data = single_epoch.get_data()
+        
+        if epoch_data.shape[0] > 0:
+            data = epoch_data[0]
+            n_channels = 18
+            n_times = expected_length
+            
+            # 形状调整（保持原逻辑）
+            if data.shape[0] != n_channels:
+                if data.shape[0] > n_channels:
+                    data = data[:n_channels, :]
+                else:
+                    padding = np.zeros((n_channels - data.shape[0], data.shape[1]))
+                    data = np.vstack([data, padding])
+            
+            if data.shape[1] != n_times:
+                if data.shape[1] > n_times:
+                    excess = data.shape[1] - n_times
+                    start_idx = excess // 2
+                    end_idx = start_idx + n_times
+                    data = data[:, start_idx:end_idx]
+                else:
+                    padding_needed = n_times - data.shape[1]
+                    pad_left = padding_needed // 2
+                    pad_right = padding_needed - pad_left
+                    data = np.pad(data, ((0, 0), (pad_left, pad_right)),
+                                 mode='constant', constant_values=0)
+            
+            tensor = torch.FloatTensor(data).unsqueeze(0)  # [1, 18, n_times]
+            safe_desc = annotation_desc.replace('/', '_').replace('\\', '_')
+            
+            all_epoch_data.append(tensor)
+            all_annotation_descs.append(safe_desc)
+    
+    print(f"Prepared {len(all_epoch_data)} epochs in memory")
+    
+    # ============== 新增：多进程保存函数 ==============
+    def save_epoch_batch(batch_indices, batch_data, batch_descs, output_dir, target_sfreq, start_idx=0):
+        """一个进程保存一批epochs"""
+        local_saved = 0
+        for idx, (tensor, desc) in zip(batch_indices, zip(batch_data, batch_descs)):
+            pt_filename = f"epoch_{idx + start_idx + 1:05d}_{desc}_{target_sfreq}Hz.pt"
+            pt_filepath = os.path.join(output_dir, pt_filename)
+            torch.save(tensor, pt_filepath)
+            local_saved += 1
+            
+            # 进度显示（减少频率，避免太多输出）
+            if local_saved % 50 == 0:
+                print(f"  Worker saved {local_saved}/{len(batch_data)} files")
+        
+        return local_saved
+    
+    # ============== 新增：创建任务分块 ==============
+    n_epochs = len(all_epoch_data)
+    n_workers = min(cpu_count(), 8)  # 限制最大8个进程，避免过度切换
+    chunk_size = max(100, n_epochs // (n_workers * 2))  # 每块至少100个epochs
+    
+    print(f"Using {n_workers} workers, chunk size: {chunk_size}")
+    
+    # 分块数据
+    batches = []
+    for i in range(0, n_epochs, chunk_size):
+        end_idx = min(i + chunk_size, n_epochs)
+        batch_indices = list(range(i, end_idx))
+        batch_data = all_epoch_data[i:end_idx]
+        batch_descs = all_annotation_descs[i:end_idx]
+        batches.append((batch_indices, batch_data, batch_descs, i))
+    
+    # ============== 新增：多进程保存 ==============
+    print(f"Starting parallel save with {len(batches)} batches...")
+    
+    saved_count = 0
+    with Pool(processes=n_workers) as pool:
+        # 准备partial函数
+        save_func = partial(save_epoch_batch, 
+                           output_dir=output_dir, 
+                           target_sfreq=target_sfreq)
+        
+        # 提交所有任务
+        results = []
+        for batch_idx, (indices, data, descs, start_i) in enumerate(batches):
+            result = pool.apply_async(save_func, (indices, data, descs, start_i))
+            results.append((batch_idx, result))
+        
+        # 收集结果
+        for batch_idx, result in results:
+            try:
+                batch_saved = result.get(timeout=300)  # 5分钟超时
+                saved_count += batch_saved
+                print(f"Batch {batch_idx + 1}/{len(batches)}: saved {batch_saved} files")
+            except Exception as e:
+                print(f"Error in batch {batch_idx}: {e}")
+    
+    print(f"Saved {saved_count} PT files to {output_dir}")
+    # ============== 替换结束 ==============
