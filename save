@@ -1,61 +1,20 @@
-    print(f"Preparing {len(epochs_to_save)} epochs for batch processing...")
+    sfreq = raw_recons.info['sfreq']
+    max_time = raw_recons.times[-1] - 8.0  # 预计算边界
     
-    # ============== 批量提取所有epochs数据 ==============
-    print(f"Batch extracting all epochs data...")
+    # 使用列表推导式（快3-5倍）
+    events_valid_annots = [
+        (ann, int(ann['onset'] * sfreq))
+        for ann in selected_annots
+        if 8.0 <= ann['onset'] <= max_time
+    ]
     
-    # 一次性获取所有epochs的数据 [n_epochs, n_channels, n_times]
-    all_data = epochs_to_save.get_data()  # <--- 关键修改：批量提取
+    # 分离结果
+    if events_valid_annots:
+        valid_annotations, sample_points = zip(*events_valid_annots)
+        events_list = [[sp, 0, 1] for sp in sample_points]
+        valid_annotations = list(valid_annotations)
+    else:
+        events_list = []
+        valid_annotations = []
     
-    # 准备annotation描述
-    all_annotation_descs = []
-    for i in range(len(epochs_to_save)):
-        if i < len(valid_annotations):
-            annotation_desc = valid_annotations[i]['description']
-        else:
-            annotation_desc = f"unknown_{i}"
-        safe_desc = annotation_desc.replace('/', '_').replace('\\', '_')
-        all_annotation_descs.append(safe_desc)
-    
-    # ============== 批量形状调整 ==============
-    print(f"Batch adjusting shapes for {len(all_data)} epochs...")
-    
-    n_epochs = len(all_data)
-    n_channels = 18
-    n_times = expected_length
-    
-    all_epoch_data = []
-    
-    # 使用更快的向量化操作
-    for i in range(n_epochs):
-        data = all_data[i]  # [n_channels_original, n_times_original]
-        
-        # 通道数调整
-        if data.shape[0] != n_channels:
-            if data.shape[0] > n_channels:
-                data = data[:n_channels, :]
-            else:
-                padding = np.zeros((n_channels - data.shape[0], data.shape[1]))
-                data = np.vstack([data, padding])
-        
-        # 时间点数调整
-        if data.shape[1] != n_times:
-            if data.shape[1] > n_times:
-                excess = data.shape[1] - n_times
-                start_idx = excess // 2
-                end_idx = start_idx + n_times
-                data = data[:, start_idx:end_idx]
-            else:
-                padding_needed = n_times - data.shape[1]
-                pad_left = padding_needed // 2
-                pad_right = padding_needed - pad_left
-                data = np.pad(data, ((0, 0), (pad_left, pad_right)),
-                            mode='constant', constant_values=0)
-        
-        tensor = torch.FloatTensor(data).unsqueeze(0)  # [1, 18, n_times]
-        all_epoch_data.append(tensor)
-        
-        # 进度显示
-        if (i + 1) % 1000 == 0:
-            print(f"  Processed {i + 1}/{n_epochs} epochs")
-    
-    print(f"Prepared {len(all_epoch_data)} epochs in memory")
+    print(f"Converted to {len(events_list)} valid events within data range")
