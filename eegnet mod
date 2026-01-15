@@ -288,8 +288,8 @@ def quick_test_model():
     soz_pred, hemisphere_pred = model(test_input)
 
     print(f"input shaope: {test_input.shape}")
-    print(f"soz predict shape: {soz_pred.shape}")  # 应为 [4, 18]
-    print(f"hemisphere shape: {hemisphere_pred.shape}")  # 应为 [4, 2]
+    print(f"soz predict shape: {soz_pred.shape}")  
+    print(f"hemisphere shape: {hemisphere_pred.shape}")  
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
