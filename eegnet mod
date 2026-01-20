@@ -40,7 +40,7 @@ class SimpleEEGDataset(Dataset):
 
 
 def get_dataloaders():
-    data_dir = "/home/sv25/desktop/eeg_epoch_output"
+    data_root = "/home/sv25/desktop/eeg_epochs_output"
     files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.pt')]
 
     selected = random.sample(files, min(10000, len(files)))
