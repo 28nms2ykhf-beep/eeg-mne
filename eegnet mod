@@ -41,21 +41,41 @@ class SimpleEEGDataset(Dataset):
 
 def get_dataloaders():
     data_root = "/home/sv25/desktop/eeg_epochs_output"
-    files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.pt')]
+    all_pt_files = []
 
-    selected = random.sample(files, min(10000, len(files)))
+    for patient_id in os.listdir(data_root):
+        patient_path = os.path.join(data_root, patient_id)
+        if not os.path.isdir(patient_path):
+            continue
 
-    split = int(0.8 * len(selected))
-    train_files, val_files = selected[:split], selected[split:]
+        for sess_dir in os.listdir(patient_path):
+            session_path = os.path.join(patient_path, session_dir)
+            all_pt_files.append(file_path)
+
+    print(f"numbers of file has been found{len(all_pt_files)}")
+
+
+    max_files = 10000
+    if len(all_pt_files) > max_files:
+        selected_files = random.sample(all_pt_files, max_files)
+    else:
+        selected_files = all_pt_files
+        print(f"warning: there are not enopugh files has been extracted, only {len(all_pt_files)}has been extracted")
+
+
+    split = (int(0.8) * len(selected_files))
+    train_files = selected_files[:split]
+    val_files = selected_files[:split]
+
+    print(f"training samples: {len(train_files)}")
+    print(f"validation files{len(val_files)}")
+
+    ##dataloader
 
     train_loader = DataLoader(SimpleEEGDataset(train_files), batch_size=100, shuffle=True)
     val_loader = DataLoader(SimpleEEGDataset(val_files), batch_size=100, shuffle=False)
-
     return train_loader, val_loader
 
-
-train_loader, val_loader = get_dataloaders()
-print(f"batches has been trained: {len(train_loader)}, number of validation batches: {len(val_loader)}")
 
 
 
@@ -95,7 +115,7 @@ class FrequencyAttention(nn.Module):
         self.freq_pool = nn.AdaptiveAvgPool2d((None, 1))
         self.attention = nn.Sequential(
             nn.Conv2d(in_channels, in_channels // 8, 1),
-            nn.ReLU(),
+            nn.ELU(),
             nn.Conv2d(in_channels // 8, in_channels, 1),
             nn.Sigmoid()
         )
@@ -184,9 +204,9 @@ class EEGNetSOZ(nn.Module):
 
         self.time_attention = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, None)),
-            nn.Conv1d(F2, F2 // 4, 1),
-            nn.ReLU(),
-            nn.Conv1d(F2 // 4, F2, 1),
+            nn.Conv2d(F2, F2 // 4, 1),
+            nn.ELU(),
+            nn.Conv2d(F2 // 4, F2, 1),
             nn.Sigmoid()
         )
 
@@ -225,7 +245,7 @@ class EEGNetSOZ(nn.Module):
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='elu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
@@ -306,3 +326,12 @@ if __name__ == "__main__":
 
     print("\n=== model structure ===")
     print(model)
+
+
+
+
+################################################
+i need to define training epochs,
+loss function
+optimizer
+training process
