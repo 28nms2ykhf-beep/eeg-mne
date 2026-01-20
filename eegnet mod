@@ -17,6 +17,7 @@ Main modifications (optimized for your task):
 5. Adjusted convolutional kernel size: Adapted to your sampling rate (typically 200Hz)"""
 
 
+
 import os, random
 import torch
 import torch.nn as nn
@@ -24,19 +25,43 @@ import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 
+
 #### data loading
 class SimpleEEGDataset(Dataset):
     def __init__(self, files):
         self.files = files
-
-    def __len__(self):
-        return len(self.files)
+        # 为每个通道定义确切的大脑半球（0=左，1=右，2=中线）
+        # 这是基于标准10-20系统的longitudinal bipolar montage
+        self.channel_hemispheres = torch.tensor([
+            0, 0, 0, 0,  # FP1-F7, F7-T3, T3-T5, T5-O1 (左脑)
+            1, 1, 1, 1,  # FP2-F8, F8-T4, T4-T6, T6-O2 (右脑)
+            2, 2,  # FZ-CZ, CZ-PZ (中线)
+            0, 0, 1, 1,  # T3-C3, C3-CZ, CZ-C4, C4-T4 (左右交叉，但可归类)
+            0, 0, 0, 0,  # FP1-F3, F3-C3, C3-P3, P3-O1 (左脑)
+        ])
 
     def __getitem__(self, idx):
         data = torch.load(self.files[idx])
         eeg = data['eeg'].float().unsqueeze(0)
-        labels = data['soz_labels'].float() if 'soz_labels' in data else torch.zeros(18)
-        return eeg, labels
+        soz_labels = data['soz_labels'].float() if 'soz_labels' in data else torch.zeros(18)
+
+        # 方法1：基于电极位置生成伪标签
+        hemisphere_label = self._get_hemisphere_pseudo_label(soz_labels)
+
+        return eeg, soz_labels, hemisphere_label
+
+    def _get_hemisphere_pseudo_label(self, soz_labels):
+        left_mask = self.channel_hemispheres == 0
+        right_mask = self.channel_hemispheres == 1
+
+        left_soz = torch.sum(soz_labels[left_mask]).item()
+        right_soz = torch.sum(soz_labels[right_mask]).item()
+
+        if left_soz + right_soz > 0:
+            return 0 if left_soz >= right_soz else 1
+        else:
+            return random.choices([0, 1], weights=[0.55, 0.45])[0]  # 轻微偏左
+
 
 
 def get_dataloaders():
@@ -54,14 +79,12 @@ def get_dataloaders():
 
     print(f"numbers of file has been found{len(all_pt_files)}")
 
-
     max_files = 10000
     if len(all_pt_files) > max_files:
         selected_files = random.sample(all_pt_files, max_files)
     else:
         selected_files = all_pt_files
         print(f"warning: there are not enopugh files has been extracted, only {len(all_pt_files)}has been extracted")
-
 
     split = (int(0.8) * len(selected_files))
     train_files = selected_files[:split]
@@ -75,8 +98,6 @@ def get_dataloaders():
     train_loader = DataLoader(SimpleEEGDataset(train_files), batch_size=100, shuffle=True)
     val_loader = DataLoader(SimpleEEGDataset(val_files), batch_size=100, shuffle=False)
     return train_loader, val_loader
-
-
 
 
 class SOZHead(nn.Module):
@@ -210,10 +231,9 @@ class EEGNetSOZ(nn.Module):
             nn.Sigmoid()
         )
 
-
-        self.adaptive_norm = AdaptiveNormalization(Chans)     # normalization
-        self._calculate_flatten_dim()                       # flatten the matrix
-        self.soz_head = SOZHead(self.flatten_dim, soz_channels)   #output layer
+        self.adaptive_norm = AdaptiveNormalization(Chans)  # normalization
+        self._calculate_flatten_dim()  # flatten the matrix
+        self.soz_head = SOZHead(self.flatten_dim, soz_channels)  # output layer
 
         self.hemisphere_head = nn.Sequential(
             nn.Linear(self.flatten_dim, 64),
@@ -308,8 +328,8 @@ def quick_test_model():
     soz_pred, hemisphere_pred = model(test_input)
 
     print(f"input shaope: {test_input.shape}")
-    print(f"soz predict shape: {soz_pred.shape}")  
-    print(f"hemisphere shape: {hemisphere_pred.shape}")  
+    print(f"soz predict shape: {soz_pred.shape}")
+    print(f"hemisphere shape: {hemisphere_pred.shape}")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -328,26 +348,31 @@ if __name__ == "__main__":
     print(model)
 
 
-
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score, accuracy_score
 
+
 def train_model(model, train_loader, val_loader, epochs=50, learning_rate=1e-3):
     """model training"""
-    criteration_soz = nn.BCELoss()
-    criterion_hemi =nn.CrossEntropyLoss()
+    # 1. define loss function
+    criterion_soz = nn.BCELoss()  # binary for soz pred
+    criterion_hemi = nn.CrossEntropyLoss()  # hemi is multi classification
 
+    # 2. optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scjeduler = torch.optim.lr_scheduer.CosinAnnealingLR(optimizer, T_max=epochs)
 
-    history = {'train_loss':[],
-               'val_loss':[],
-               'train_soz_auc':[],
-               'val_soz_auc':[],
-               'train_hemi_acc':[],
-               'val_hemi_acc':[]
-               }
-    
+    # 3. adjust LR
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    # 4. history
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'train_soz_auc': [],
+        'val_soz_auc': [],
+        'train_hemi_acc': [],
+        'val_hemi_acc': []
+    }
 
     for epoch in range(epochs):
         model.train()
@@ -356,32 +381,194 @@ def train_model(model, train_loader, val_loader, epochs=50, learning_rate=1e-3):
         train_soz_labels = []
         train_hemi_preds = []
         train_hemi_labels = []
-        
 
         for batch_idx, (eeg_data, soz_labels) in enumerate(train_loader):
             optimizer.zero_grad()
 
+            # forward
+            soz_pred, hemi_pred = model(eeg_data)
+
+
+            batch_size = eeg_data.size(0)
+            hemisphere_labels = torch.randint(0, 2, (batch_size,))
+
+            # loss caculation
+            loss_soz = criterion_soz(soz_pred, soz_labels)
+            loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels)
+
+            # combined loss
+            total_loss = 0.7 * loss_soz + 0.3 * loss_hemi
+
+            # backward prop
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            # documentation
+            train_loss += total_loss.item()
+            train_soz_preds.append(soz_pred.detach())
+            train_soz_labels.append(soz_labels.detach())
+            train_hemi_preds.append(hemi_pred.detach().argmax(dim=1))
+            train_hemi_labels.append(hemisphere_labels.detach())
+
+            if batch_idx % 10 == 0:
+                print(f'Epoch {epoch+1}/{epochs} | Batch {batch_idx}/{len(train_loader)} | Loss: {total_loss.item():.4f}')
+
+        train_loss /= len(train_loader)
+        train_soz_preds = torch.cat(train_soz_preds)
+        train_soz_labels = torch.cat(train_soz_labels)
+        train_hemi_preds = torch.cat(train_hemi_preds)
+        train_hemi_labels = torch.cat(train_hemi_labels)
+
+        # validation
+        val_loss, val_soz_auc, val_hemi_acc = validate_model(model, val_loader, criterion_soz, criterion_hemi)
+
+        # history
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['val_soz_auc'].append(val_soz_auc)
+        history['val_hemi_acc'].append(val_hemi_acc)
+
+        # renew LR
+        scheduler.step()
+
+        print(f'\nEpoch {epoch + 1}/{epochs}:')
+        print(f'  Train Loss: {train_loss:.4f}')
+        print(f'  Val Loss: {val_loss:.4f}')
+        print(f'  Val SOZ AUC: {val_soz_auc:.4f}')
+        print(f'  Val Hemisphere Acc: {val_hemi_acc:.4f}')
+        print('-' * 50)
+
+    return model, history
+
+
+def validate_model(model, val_loader, criterion_soz, criterion_hemi):
+    """validation model"""
+    model.eval()
+    val_loss = 0.0
+    all_soz_preds = []
+    all_soz_labels = []
+    all_hemi_preds = []
+    all_hemi_labels = []
+
+    with torch.no_grad():
+        for eeg_data, soz_labels in val_loader:
             soz_pred, hemi_pred = model(eeg_data)
 
             batch_size = eeg_data.size(0)
-            hemisphere_labels =torch.randint(0, 2, (batch))
+            hemisphere_labels = torch.randint(0, 2, (batch_size,))
 
-            loss_soz = criteration_soz(soz_pred, soz_labels)
-            loss_hemi =criteration_hemi(hemi_pred, hemisphere_labels)
+            loss_soz = criterion_soz(soz_pred, soz_labels)
+            loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels)
+            total_loss = 0.7 * loss_soz + 0.3 * loss_hemi
 
-            total_loss = 0.7 * loss_soz +0.3 * loss_hemi
+            val_loss += total_loss.item()
+
+            all_soz_preds.append(soz_pred)
+            all_soz_labels.append(soz_labels)
+            all_hemi_preds.append(hemi_pred.argmax(dim=1))
+            all_hemi_labels.append(hemisphere_labels)
+
+    val_loss /= len(val_loader)
+
+    # caculate auc-soz
+    all_soz_preds = torch.cat(all_soz_preds).cpu().numpy()
+    all_soz_labels = torch.cat(all_soz_labels).cpu().numpy()
+
+    # average for auc for every channel
+    channel_aucs = []
+    for ch in range(all_soz_preds.shape[1]):
+        try:
+            auc = roc_auc_score(all_soz_labels[:, ch], all_soz_preds[:, ch])
+            channel_aucs.append(auc)
+        except:
+            channel_aucs.append(0.5)
+
+    soz_auc = np.mean(channel_aucs)
+
+    # accuracy for hemi
+    all_hemi_preds = torch.cat(all_hemi_preds).cpu().numpy()
+    all_hemi_labels = torch.cat(all_hemi_labels).cpu().numpy()
+    hemi_acc = accuracy_score(all_hemi_labels, all_hemi_preds)
+
+    return val_loss, soz_auc, hemi_acc
 
 
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(),max_norm=1.0)
-            optimizer.step()
+def plot_training_history(history):
+    """plotting training history"""
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
-            train_loss+=total_loss.item()
-            train_soz_preds.append(soz_pred.detach())
-            train_soz_labels.append(soz_labels.detach())
-            train_hemi_preds.append(hemi_pred.detach())
-            train_hemi_labels.append(hemisphere_labels.detach())
+    epochs = range(1, len(history['train_loss']) + 1)
 
-            if batch_idx % 10 ==0:
-                print(f'epochs (epoch+1)/{epochs} | Batch (batch_idx)/{len(train_loader)} |
-                      Loss: {total_loss.item():.4f})
+    # loss graph
+    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train Loss')
+    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Val Loss')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].set_title('Training and Validation Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # SOZ AUC curve
+    axes[0, 1].plot(epochs, history['val_soz_auc'], 'g-', label='SOZ AUC')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('AUC')
+    axes[0, 1].set_title('SOZ Prediction AUC')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].set_ylim([0.4, 1.0])
+
+    # hemi accuracy
+    axes[1, 0].plot(epochs, history['val_hemi_acc'], 'm-', label='Hemisphere Acc')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Accuracy')
+    axes[1, 0].set_title('Hemisphere Classification Accuracy')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].set_ylim([0.4, 1.0])
+
+    # LR curve
+    axes[1, 1].axis('off')
+
+    plt.tight_layout()
+    plt.savefig('training_history.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    # loss graph
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, history['train_loss'], 'b-', linewidth=2, label='Train Loss')
+    plt.plot(epochs, history['val_loss'], 'r-', linewidth=2, label='Val Loss')
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title('Loss Curve', fontsize=14)
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.savefig('loss_curve.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+
+if __name__ == "__main__":
+    print("=== quick test ===")
+    model = quick_test_model()
+
+    print("\n=== get data loader ===")
+    train_loader, val_loader = get_dataloaders()
+
+    print("\n=== starts training ===")
+    print(f"training batch: {len(train_loader)}")
+    print(f"validate batch: {len(val_loader)}")
+
+    trained_model, history = train_model(
+        model,
+        train_loader,
+        val_loader,
+        epochs=10,
+        learning_rate=1e-3
+    )
+
+    print("\n=== training history curve ===")
+    plot_training_history(history)
+
+    # save model
+    torch.save(trained_model.state_dict(), 'eegnet_soz_model.pth')
+    print("model has been saved as 'eegnet_soz_model.pth'")
