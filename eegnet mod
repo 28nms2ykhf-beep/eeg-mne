@@ -329,9 +329,59 @@ if __name__ == "__main__":
 
 
 
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_auc_score, accuracy_score
 
-################################################
-i need to define training epochs,
-loss function
-optimizer
-training process
+def train_model(model, train_loader, val_loader, epochs=50, learning_rate=1e-3):
+    """model training"""
+    criteration_soz = nn.BCELoss()
+    criterion_hemi =nn.CrossEntropyLoss()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    scjeduler = torch.optim.lr_scheduer.CosinAnnealingLR(optimizer, T_max=epochs)
+
+    history = {'train_loss':[],
+               'val_loss':[],
+               'train_soz_auc':[],
+               'val_soz_auc':[],
+               'train_hemi_acc':[],
+               'val_hemi_acc':[]
+               }
+    
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        train_soz_preds = []
+        train_soz_labels = []
+        train_hemi_preds = []
+        train_hemi_labels = []
+        
+
+        for batch_idx, (eeg_data, soz_labels) in enumerate(train_loader):
+            optimizer.zero_grad()
+
+            soz_pred, hemi_pred = model(eeg_data)
+
+            batch_size = eeg_data.size(0)
+            hemisphere_labels =torch.randint(0, 2, (batch))
+
+            loss_soz = criteration_soz(soz_pred, soz_labels)
+            loss_hemi =criteration_hemi(hemi_pred, hemisphere_labels)
+
+            total_loss = 0.7 * loss_soz +0.3 * loss_hemi
+
+
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(),max_norm=1.0)
+            optimizer.step()
+
+            train_loss+=total_loss.item()
+            train_soz_preds.append(soz_pred.detach())
+            train_soz_labels.append(soz_labels.detach())
+            train_hemi_preds.append(hemi_pred.detach())
+            train_hemi_labels.append(hemisphere_labels.detach())
+
+            if batch_idx % 10 ==0:
+                print(f'epochs (epoch+1)/{epochs} | Batch (batch_idx)/{len(train_loader)} |
+                      Loss: {total_loss.item():.4f})
