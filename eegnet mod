@@ -102,19 +102,19 @@ class SimpleEEGDataset(Dataset):
                     break
             self.patient_ids.append(patient_id)
 
-        def _get_ground_truth_labels(self, patient_id):
-            if patient_id in PATIENT_SOZ_INFO:
-                info = PATIENT_SOZ_INFO[patient_id]
-                soz_labels = torch.zeros(18)
-                soz_labels[info["soz_channels"]] = 1.0
+    def _get_ground_truth_labels(self, patient_id):
+        if patient_id in PATIENT_SOZ_INFO:
+            info = PATIENT_SOZ_INFO[patient_id]
+            soz_labels = torch.zeros(18)
+            soz_labels[info["soz_channels"]] = 1.0
             
-                hemisphere_label = 0 if info["hemisphere"] == "left" else 1
+            hemisphere_label = 0 if info["hemisphere"] == "left" else 1
             
-                return soz_labels, hemisphere_label, info["description"]
-            else:
-                soz_labels = torch.zeros(18)
-                hemisphere_label = 0 if random.random() < 0.5 else 1
-                return soz_labels, hemisphere_label, "unknown"
+            return soz_labels, hemisphere_label, info["description"]
+        else:
+            soz_labels = torch.zeros(18)
+            hemisphere_label = 0 if random.random() < 0.5 else 1
+            return soz_labels, hemisphere_label, "unknown"
     
     def __len__(self):
         return len(self.files)
