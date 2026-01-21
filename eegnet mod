@@ -125,22 +125,27 @@ class SimpleEEGDataset(Dataset):
         
         try:
             eeg_data = torch.load(file_path, map_location='cpu')
-            
+    
             if isinstance(eeg_data, torch.Tensor):
                 eeg = eeg_data.float()
             else:
                 eeg = torch.randn(1, 18, 4096).float()
-            
+    
+
             if eeg.dim() == 2:  # [18, 4096]
                 eeg = eeg.unsqueeze(0)  # [1, 18, 4096]
-            elif eeg.dim() == 3 and eeg.shape[0] > 1:  # [n, 18, 4096]
-                eeg = eeg[0:1]  
-        
-            if eeg.shape[1] != 18 or eeg.shape[2] != 4096:
-                if eeg.shape[1] == 18 and eeg.shape[2] > 4096:
-                    eeg = eeg[:, :, :4096]
-                else:
-                    eeg = torch.randn(1, 18, 4096).float()
+            elif eeg.dim() == 3:  # [n, 18, 4096]
+                eeg = eeg[0:1]
+            else:
+                raise ValueError(f"Unexpected tensor shape: {eeg.shape}")
+    
+            if eeg.shape[1] != 18:
+                raise ValueError(f"Expected 18 channels, got {eeg.shape[1]}")
+    
+            if eeg.shape[2] < 4096:
+                raise ValueError(f"Expected at least 4096 time points, got {eeg.shape[2]}")
+            elif eeg.shape[2] > 4096:
+                eeg = eeg[:, :, :4096]
             
             soz_labels, hemisphere_label, description = self._get_ground_truth_labels(patient_id)
             
