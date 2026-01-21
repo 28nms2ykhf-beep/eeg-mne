@@ -86,39 +86,79 @@ class SimpleEEGDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        data = torch.load(self.files[idx])
-        eeg = data['eeg'].float().unsqueeze(0)
-
-        if eeg.shape[1] != 18:
-            if eeg.shape[1] > 18:
-                eeg = eeg[:, :18, :]
-            else:
-                padding = torch.zeros(1, 18 - eeg.shape[1], eeg.shape[2])
-                eeg = torch.cat([eeg, padding], dim=1)
-
-        if eeg.shape[2] != 4096:
-            if eeg.shape[2] > 4096:
-                eeg = eeg[:, :, :4096]
-            else:
-                padding = torch.zeros(1, eeg.shape[1], 4096 - eeg.shape[2])
-                eeg = torch.cat([eeg, padding], dim=2)
-
-        if 'soz_labels' in data:
-            soz_labels = data['soz_labels'].float()
-            if soz_labels.dim() == 0:
-                soz_labels = torch.zeros(18)
-            elif soz_labels.shape[0] != 18:
-                soz_labels = torch.zeros(18)
-        else:
-            soz_labels = torch.zeros(18)
-
-        hemisphere_label = self._get_hemisphere_pseudo_label(soz_labels)
-
-        return eeg, soz_labels, hemisphere_label
+        file_path = self.files[idx]
+        try:
+            data = torch.load(file_path, map_location='cpu')
         
+            if isinstance(data, dict):
+                if 'eeg' in data:
+                    eeg_data = data['eeg']
+                else:
+                    for key in ['signal', 'data', 'eeg_data', 'raw', 'eeg_signal']:
+                        if key in data and isinstance(data[key], torch.Tensor):
+                            eeg_data = data[key]
+                            break
+                    else:
+                        eeg_data = torch.randn(1, 18, 4096)
+            
 
-
-    def get_dataloaders(max_samples=10000, batch_size=32):
+                if 'soz_labels' in data:
+                    soz_labels = data['soz_labels'].float()
+                    if soz_labels.dim() == 0:
+                        soz_labels = torch.zeros(18)
+                    elif soz_labels.shape[0] != 18:
+                        soz_labels = torch.zeros(18)
+                else:
+                    soz_labels = torch.zeros(18)
+                
+            elif isinstance(data, torch.Tensor):
+                eeg_data = data
+            
+                soz_labels = torch.zeros(18)
+            
+            else:
+                print(f"Warning: {file_path} unknown format: {type(data)}")
+                eeg_data = torch.randn(1, 18, 4096)
+                soz_labels = torch.zeros(18)
+        
+            if not isinstance(eeg_data, torch.Tensor):
+                eeg_data = torch.tensor(eeg_data, dtype=torch.float32)
+        
+            if eeg_data.dim() == 3:
+                if eeg_data.shape[0] == 1:
+                    eeg = eeg_data.float()
+                else:
+                    eeg = eeg_data[0:1].float()
+            elif eeg_data.dim() == 2:
+                eeg = eeg_data.unsqueeze(0).float()
+            else:
+                print(f"Warning: {file_path} abnormal shape: {eeg_data.shape}")
+                eeg = torch.randn(1, 18, 4096).float()
+        
+            if eeg.shape[1] != 18 or eeg.shape[2] != 4096:
+                if eeg.shape[1] == 18 and eeg.shape[2] > 4096:
+                    eeg = eeg[:, :, :4096]
+                elif eeg.shape[1] == 18 and eeg.shape[2] < 4096:
+                    padding = torch.zeros(1, 18, 4096 - eeg.shape[2])
+                    eeg = torch.cat([eeg, padding], dim=2)
+                else:
+                    print(f"Warning: {file_path} wrong shape: {eeg.shape}")
+                    eeg = torch.randn(1, 18, 4096).float()
+        
+            hemisphere_label = self._get_hemisphere_pseudo_label(soz_labels)
+        
+            return eeg, soz_labels, hemisphere_label
+        
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            eeg = torch.randn(1, 18, 4096).float()
+            soz_labels = torch.zeros(18)
+            hemisphere_label = 0
+            return eeg, soz_labels, hemisphere_label
+        
+ 
+    @staticmethod
+    def get_dataloaders(max_samples=200000, batch_size=64):
         data_root = "/home/sv25/Desktop/eeg_epochs_output"
         all_pt_files = []
 
@@ -420,7 +460,7 @@ def quick_test_model():
     return model
 
 
-def train_model(model, train_loader, val_loader, epochs=10, learning_rate=1e-3):
+def train_model(model, train_loader, val_loader, epochs=20, learning_rate=1e-3):
     """training model"""
     criterion_soz = nn.BCELoss()
     criterion_hemi = nn.CrossEntropyLoss()
@@ -654,7 +694,7 @@ if __name__ == "__main__":
     model = quick_test_model()
 
     print("\nloading data...")
-    train_loader, val_loader = get_dataloaders(max_samples=10000, batch_size=32)
+    train_loader, val_loader = SimpleEEGDataset.get_dataloaders(max_samples=10000, batch_size=64)
 
     if train_loader is None or val_loader is None:
         print("failed to load data")
@@ -668,7 +708,7 @@ if __name__ == "__main__":
         model,
         train_loader,
         val_loader,
-        epochs=10,
+        epochs=20,
         learning_rate=1e-3
     )
 
