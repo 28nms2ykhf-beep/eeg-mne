@@ -27,6 +27,35 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import roc_auc_score, accuracy_score
 
 
+PATIENT_SOZ_INFO = {
+    'patient_150009930': {
+        'hemisphere': 'right', 
+        'soz_channels': [4, 5, 6, 7, 12, 13, 14, 15],  
+        'dominant_channels': [5, 6, 13, 14]  
+    },
+    'patient_150017287': {
+        'hemisphere': 'left',   
+        'soz_channels': [0, 1, 2, 3, 8, 9, 10, 11],  
+        'dominant_channels': [0, 1, 8, 9]  
+    },
+    'patient_150008470': {
+        'hemisphere': 'left',
+        'soz_channels': [0, 1, 2, 3, 8, 9, 10, 11],  
+        'dominant_channels': [1, 2, 9, 10]  
+    },
+    'patient_150003791': {
+        'hemisphere': 'left',
+        'soz_channels': [0, 1, 2, 3, 8, 9, 10, 11],  
+        'dominant_channels': [2, 3, 10, 11]  
+    },
+    'patient_150005601': {
+        'hemisphere': 'left',
+        'soz_channels': [0, 1, 2, 3, 8, 9, 10, 11],  
+        'dominant_channels': [0, 1, 2, 8, 9, 10]  
+    }
+}
+
+
 class SimpleEEGDataset(Dataset):
     def __init__(self, files):
         self.files = files
@@ -34,7 +63,6 @@ class SimpleEEGDataset(Dataset):
         # left brain: 0-3, 8-11 (8)
         # right brain: 4-7, 12-15 (8)
         # midline: 16-17 (2)
-
         self.channel_names = [
             'Fp1-F7',   # 0: 
             'F7-T3',    # 1: 
@@ -64,104 +92,72 @@ class SimpleEEGDataset(Dataset):
             2, 2  # 16-17: midline
         ])
 
-        print("channel-label match validation")
-        for i, (name, hemi) in enumerate(zip(self.channel_names, self.channel_hemispheres)):
-            hemisphere = ['left', 'right', 'midline'][int(hemi)]
-            print(f"channel {i:2d}: {name:10s} → {hemisphere}")
+        self.patient_ids = []
+        for file_path in self.files:
+            parts = file_path.split('/')
+            patient_id = None
+            for part in parts:
+                if part.startswith('patient_'):
+                    patient_id = part
+                    break
+            self.patient_ids.append(patient_id)
 
-    def _get_hemisphere_pseudo_label(self, soz_labels):
-        """determine hemisphere based on soz label"""
-        left_mask = self.channel_hemispheres == 0
-        right_mask = self.channel_hemispheres == 1
-
-        left_soz = torch.sum(soz_labels[left_mask]).item()
-        right_soz = torch.sum(soz_labels[right_mask]).item()
-
-        if left_soz + right_soz > 0:
-            return 0 if left_soz >= right_soz else 1
-        else:
-            return 0 if random.random() < 0.55 else 1
+        def _get_ground_truth_labels(self, patient_id):
+            if patient_id in VALIDATION_PATIENTS:
+                info = VALIDATION_PATIENTS[patient_id]
+                soz_labels = torch.zeros(18)
+                soz_labels[info["soz_channels"]] = 1.0
+            
+                hemisphere_label = 0 if info["hemisphere"] == "left" else 1
+            
+                return soz_labels, hemisphere_label, info["description"]
+            else:
+                soz_labels = torch.zeros(18)
+                hemisphere_label = 0 if random.random() < 0.5 else 1
+                return soz_labels, hemisphere_label, "unknown"
     
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
         file_path = self.files[idx]
+        patient_id = self.patient_ids[idx]
+        
         try:
-            data = torch.load(file_path, map_location='cpu')
-        
-            if isinstance(data, dict):
-                if 'eeg' in data:
-                    eeg_data = data['eeg']
-                else:
-                    for key in ['signal', 'data', 'eeg_data', 'raw', 'eeg_signal']:
-                        if key in data and isinstance(data[key], torch.Tensor):
-                            eeg_data = data[key]
-                            break
-                    else:
-                        eeg_data = torch.randn(1, 18, 4096)
+            eeg_data = torch.load(file_path, map_location='cpu')
             
-
-                if 'soz_labels' in data:
-                    soz_labels = data['soz_labels'].float()
-                    if soz_labels.dim() == 0:
-                        soz_labels = torch.zeros(18)
-                    elif soz_labels.shape[0] != 18:
-                        soz_labels = torch.zeros(18)
-                else:
-                    soz_labels = torch.zeros(18)
-                
-            elif isinstance(data, torch.Tensor):
-                eeg_data = data
-            
-                soz_labels = torch.zeros(18)
-            
+            if isinstance(eeg_data, torch.Tensor):
+                eeg = eeg_data.float()
             else:
-                print(f"Warning: {file_path} unknown format: {type(data)}")
-                eeg_data = torch.randn(1, 18, 4096)
-                soz_labels = torch.zeros(18)
-        
-            if not isinstance(eeg_data, torch.Tensor):
-                eeg_data = torch.tensor(eeg_data, dtype=torch.float32)
-        
-            if eeg_data.dim() == 3:
-                if eeg_data.shape[0] == 1:
-                    eeg = eeg_data.float()
-                else:
-                    eeg = eeg_data[0:1].float()
-            elif eeg_data.dim() == 2:
-                eeg = eeg_data.unsqueeze(0).float()
-            else:
-                print(f"Warning: {file_path} abnormal shape: {eeg_data.shape}")
                 eeg = torch.randn(1, 18, 4096).float()
+            
+            if eeg.dim() == 2:  # [18, 4096]
+                eeg = eeg.unsqueeze(0)  # [1, 18, 4096]
+            elif eeg.dim() == 3 and eeg.shape[0] > 1:  # [n, 18, 4096]
+                eeg = eeg[0:1]  
         
             if eeg.shape[1] != 18 or eeg.shape[2] != 4096:
                 if eeg.shape[1] == 18 and eeg.shape[2] > 4096:
                     eeg = eeg[:, :, :4096]
-                elif eeg.shape[1] == 18 and eeg.shape[2] < 4096:
-                    padding = torch.zeros(1, 18, 4096 - eeg.shape[2])
-                    eeg = torch.cat([eeg, padding], dim=2)
                 else:
-                    print(f"Warning: {file_path} wrong shape: {eeg.shape}")
                     eeg = torch.randn(1, 18, 4096).float()
-        
-            hemisphere_label = self._get_hemisphere_pseudo_label(soz_labels)
-        
-            return eeg, soz_labels, hemisphere_label
-        
+            
+            soz_labels, hemisphere_label, description = self._get_ground_truth_labels(patient_id)
+            
+            return eeg, soz_labels, hemisphere_label, patient_id
+            
         except Exception as e:
             print(f"Error loading {file_path}: {e}")
             eeg = torch.randn(1, 18, 4096).float()
             soz_labels = torch.zeros(18)
             hemisphere_label = 0
-            return eeg, soz_labels, hemisphere_label
+            return eeg, soz_labels, hemisphere_label, "error"
         
  
     @staticmethod
-    def get_dataloaders(max_samples=200000, batch_size=64):
+    def get_dataloaders(max_samples=10000, batch_size=32, validation_split=0.2):
         data_root = "/home/sv25/Desktop/eeg_epochs_output"
-        all_pt_files = []
-
+        
         if not os.path.exists(data_root):
             print(f"path error: {data_root}")
             return None, None
@@ -173,33 +169,74 @@ class SimpleEEGDataset(Dataset):
         if not all_pt_files:
             print(f"no .pt file")
             return None, None
-    
+
         print(f"found {len(all_pt_files)} .pt files")
+        
+        patient_files = {}
+        for file_path in all_pt_files:
+            parts = file_path.split('/')
+            patient_id = None
+            for part in parts:
+                if part.startswith('patient_'):
+                    patient_id = part
+                    break
+            
+            if patient_id:
+                if patient_id not in patient_files:
+                    patient_files[patient_id] = []
+                patient_files[patient_id].append(file_path)
+        
+        print(f"found {len(patient_files)} patients")
+        
+        validation_patient_ids = list(VALIDATION_PATIENTS.keys())
+        train_patient_ids = [pid for pid in patient_files.keys() if pid not in validation_patient_ids]
+        
+        print(f"validation patients: {validation_patient_ids}")
+        print(f"train patients: {len(train_patient_ids)}")
+        
+        train_files = []
+        for patient_id in train_patient_ids:
+            patient_file_list = patient_files[patient_id]
+            if len(patient_file_list) > max_samples // len(train_patient_ids):
+                sample_size = max_samples // len(train_patient_ids)
+                train_files.extend(random.sample(patient_file_list, min(sample_size, len(patient_file_list))))
+            else:
+                train_files.extend(patient_file_list)
+        
 
+        validation_files = []
+        for patient_id in validation_patient_ids:
+            if patient_id in patient_files:
+                patient_file_list = patient_files[patient_id]
+                num_val = int(len(patient_file_list) * validation_split)
+                if num_val > 0:
+                    validation_files.extend(random.sample(patient_file_list, num_val))
+                else:
+                    validation_files.extend(patient_file_list[:1])  
+        
 
-        if len(all_pt_files) > max_samples:
-            selected_files = random.sample(all_pt_files, max_samples)
-            print(f"randomly selected {max_samples} files from {len(all_pt_files)} total files")
-        else:
-            selected_files = all_pt_files
-            print(f"using all {len(selected_files)} files")
-
-        random.shuffle(selected_files)
-        split_idx = int(0.8 * len(selected_files))
-        train_files = selected_files[:split_idx]
-        val_files = selected_files[split_idx:]
-    
+        if len(train_files) > max_samples:
+            train_files = random.sample(train_files, max_samples)
+        
         print(f"training set has: {len(train_files)} samples")
-        print(f"validation set has: {len(val_files)} samples")
-
+        print(f"validation set has: {len(validation_files)} samples")
+        
+   
+        print("\nValidation set ground truth:")
+        for patient_id in validation_patient_ids:
+            if patient_id in VALIDATION_PATIENTS:
+                info = VALIDATION_PATIENTS[patient_id]
+                print(f"  {patient_id}: {info['description']} ({info['hemisphere']} hemisphere)")
+                print(f"    SOZ channels: {info['soz_channels']}")
+        
         train_dataset = SimpleEEGDataset(train_files)
-        val_dataset = SimpleEEGDataset(val_files)
+        val_dataset = SimpleEEGDataset(validation_files)
 
         num_workers = min(4, os.cpu_count() // 2)  
         print(f"using {num_workers} workers")
 
         train_loader = DataLoader(
-                train_dataset,
+            train_dataset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
@@ -217,6 +254,7 @@ class SimpleEEGDataset(Dataset):
         )
     
         return train_loader, val_loader
+
 
 
 class SOZHead(nn.Module):
@@ -439,255 +477,287 @@ class EEGNetSOZ(nn.Module):
             return soz_pred, hemisphere_pred
 
 
-def quick_test_model():
-    """quick model structure test"""
-    batch_size = 4
-    test_input = torch.randn(batch_size, 1, 18, 4096)
-    model = EEGNetSOZ(Chans=18, Samples=4096)
+    def quick_test_model():
+        """quick model structure test"""
+        batch_size = 4
+        test_input = torch.randn(batch_size, 1, 18, 4096)
+        model = EEGNetSOZ(Chans=18, Samples=4096)
 
-    soz_pred, hemisphere_pred = model(test_input)
+        soz_pred, hemisphere_pred = model(test_input)
 
-    print(f"input shape: {test_input.shape}")
-    print(f"SOZ prediction shape: {soz_pred.shape}")
-    print(f"hemisphere prediction shaape: {hemisphere_pred.shape}")
+        print(f"input shape: {test_input.shape}")
+        print(f"SOZ prediction shape: {soz_pred.shape}")
+        print(f"hemisphere prediction shaape: {hemisphere_pred.shape}")
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    print(f"total parameters: {total_params:,}")
-    print(f"trainable parameters: {trainable_params:,}")
+        print(f"total parameters: {total_params:,}")
+        print(f"trainable parameters: {trainable_params:,}")
 
-    return model
-
-
-def train_model(model, train_loader, val_loader, epochs=20, learning_rate=1e-3):
-    """training model"""
-    criterion_soz = nn.BCELoss()
-    criterion_hemi = nn.CrossEntropyLoss()
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-    history = {
-        'train_loss': [],
-        'val_loss': [],
-        'train_soz_auc': [],
-        'val_soz_auc': [],
-        'train_hemi_acc': [],
-        'val_hemi_acc': []
-    }
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    print(f"device: {device}")
-
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0.0
-        train_soz_preds = []
-        train_soz_labels = []
-        train_hemi_preds = []
-        train_hemi_labels = []
-
-        for batch_idx, (eeg_data, soz_labels, hemisphere_labels) in enumerate(train_loader):
-            eeg_data = eeg_data.to(device)
-            soz_labels = soz_labels.to(device)
-            hemisphere_labels = hemisphere_labels.to(device)
-
-            optimizer.zero_grad()
-
-            soz_pred, hemi_pred = model(eeg_data)
-
-            loss_soz = criterion_soz(soz_pred, soz_labels)
-            loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels)
-            total_loss = 0.7 * loss_soz + 0.3 * loss_hemi
-
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            train_loss += total_loss.item()
-            train_soz_preds.append(soz_pred.detach().cpu())
-            train_soz_labels.append(soz_labels.detach().cpu())
-            train_hemi_preds.append(hemi_pred.detach().argmax(dim=1).cpu())
-            train_hemi_labels.append(hemisphere_labels.detach().cpu())
-
-            if batch_idx % 10 == 0:
-                print(
-                    f'Epoch {epoch + 1}/{epochs} | Batch {batch_idx}/{len(train_loader)} | Loss: {total_loss.item():.4f}')
-
-        train_loss /= len(train_loader)
-        train_soz_preds = torch.cat(train_soz_preds)
-        train_soz_labels = torch.cat(train_soz_labels)
-        train_hemi_preds = torch.cat(train_hemi_preds)
-        train_hemi_labels = torch.cat(train_hemi_labels)
-
-        # validation
-        val_loss, val_soz_auc, val_hemi_acc = validate_model(model, val_loader, criterion_soz, criterion_hemi, device)
-
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['val_soz_auc'].append(val_soz_auc)
-        history['val_hemi_acc'].append(val_hemi_acc)
-
-        scheduler.step()
-
-        print(f'\nEpoch {epoch + 1}/{epochs}:')
-        print(f'train loss: {train_loss:.4f}')
-        print(f'validate loss: {val_loss:.4f}')
-        print(f'validate SOZ AUC: {val_soz_auc:.4f}')
-        print(f'validation hemisphere prediction accuracy: {val_hemi_acc:.4f}')
-        print('-' * 50)
-
-    return model, history
+        return model
 
 
-def validate_model(model, val_loader, criterion_soz, criterion_hemi, device):
-    """model validation"""
-    model.eval()
-    val_loss = 0.0
-    all_soz_preds = []
-    all_soz_labels = []
-    all_hemi_preds = []
-    all_hemi_labels = []
+    def train_model(model, train_loader, val_loader, epochs=10, learning_rate=1e-3):
+        criterion_soz = nn.BCELoss()
+        criterion_hemi = nn.CrossEntropyLoss()
 
-    with torch.no_grad():
-        for eeg_data, soz_labels, hemisphere_labels in val_loader:  
-            eeg_data = eeg_data.to(device)
-            soz_labels = soz_labels.to(device)
-            hemisphere_labels = hemisphere_labels.to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnneplingLR(optimizer, T_max=epochs)
 
-            soz_pred, hemi_pred = model(eeg_data)
+        history = {
+            'train_loss': [],
+            'val_loss': [],
+            'train_soz_auc': [],
+            'val_soz_auc': [],
+            'train_hemi_acc': [],
+            'val_hemi_acc': []
+        }
 
-            loss_soz = criterion_soz(soz_pred, soz_labels)
-            loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels)
-            total_loss = 0.7 * loss_soz + 0.3 * loss_hemi
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model.to(device)
+        print(f"device: {device}")
 
-            val_loss += total_loss.item()
+        for epoch in range(epochs):
+            model.train()
+            train_loss = 0.0
 
-            all_soz_preds.append(soz_pred.cpu())
-            all_soz_labels.append(soz_labels.cpu())
-            all_hemi_preds.append(hemi_pred.argmax(dim=1).cpu())
-            all_hemi_labels.append(hemisphere_labels.cpu())
+            for batch_idx, (eeg_data, soz_labels, hemisphere_labels, patient_ids) in enumerate(train_loader):
+                eeg_data = eeg_data.to(device)
+                soz_labels = soz_labels.to(device)
+                hemisphere_labels = hemisphere_labels.to(device)
 
-    val_loss /= len(val_loader)
+                optimizer.zero_grad()
 
-    # caculate SOZ AUC
-    all_soz_preds = torch.cat(all_soz_preds).numpy()
-    all_soz_labels = torch.cat(all_soz_labels).numpy()
+                soz_pred, hemi_pred = model(eeg_data)
 
-    channel_aucs = []
-    for ch in range(all_soz_preds.shape[1]):
-        try:
-            auc = roc_auc_score(all_soz_labels[:, ch], all_soz_preds[:, ch])
-            channel_aucs.append(auc)
-        except:
-            channel_aucs.append(0.5)
+                loss_soz = criterion_soz(soz_pred, soz_labels)
+                loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels)
+                total_loss = 0.7 * loss_soz + 0.3 * loss_hemi
 
-    soz_auc = np.mean(channel_aucs)
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
 
-    # caculate hemisphere prediction accuracy
-    all_hemi_preds = torch.cat(all_hemi_preds).numpy()
-    all_hemi_labels = torch.cat(all_hemi_labels).numpy()
-    hemi_acc = accuracy_score(all_hemi_labels, all_hemi_preds)
+                train_loss += total_loss.item()
 
-    return val_loss, soz_auc, hemi_acc
+                if batch_idx % 10 == 0:
+                    print(f'Epoch {epoch + 1}/{epochs} | Batch {batch_idx}/{len(train_loader)} | Loss: {total_loss.item():.4f}')
 
+            train_loss /= len(train_loader)
+        
+# validate 
+            val_loss, val_soz_auc, val_hemi_acc = validate_model(model, val_loader, criterion_soz, criterion_hemi, device)
 
-def plot_training_history(history):
-    """plotting training history"""
-    epochs = range(1, len(history['train_loss']) + 1)
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
+            history['val_soz_auc'].append(val_soz_auc)
+            history['val_hemi_acc'].append(val_hemi_acc)
 
-    plt.figure(figsize=(12, 4))
+            scheduler.step()
 
-    plt.subplot(1, 3, 1)
-    plt.plot(epochs, history['train_loss'], 'b-', label='Train Loss')
-    plt.plot(epochs, history['val_loss'], 'r-', label='Val Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+            print(f'\nEpoch {epoch + 1}/{epochs}:')
+            print(f'train loss: {train_loss:.4f}')
+            print(f'validate loss: {val_loss:.4f}')
+            print(f'validate SOZ AUC: {val_soz_auc:.4f}')
+            print(f'validation hemisphere prediction accuracy: {val_hemi_acc:.4f}')
+            print('-' * 50)
 
-    plt.subplot(1, 3, 2)
-    plt.plot(epochs, history['val_soz_auc'], 'g-', label='SOZ AUC')
-    plt.xlabel('Epoch')
-    plt.ylabel('AUC')
-    plt.title('SOZ Prediction AUC')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.ylim([0.4, 1.0])
-
-    plt.subplot(1, 3, 3)
-    plt.plot(epochs, history['val_hemi_acc'], 'm-', label='Hemisphere Acc')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.title('Hemisphere Classification Accuracy')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.ylim([0.4, 1.0])
-
-    plt.tight_layout()
-    plt.savefig('training_history.png', dpi=150, bbox_inches='tight')
-    plt.show()
+        return model, history
 
 
-def predict_soz_and_hemisphere(model, eeg_input, threshold=0.5):
-    """predict SOZ channel and hemisphere"""
-    model.eval()
-    device = next(model.parameters()).device
+    def validate_model(model, val_loader, criterion_soz, criterion_hemi, device):
+        model.eval()
+        val_loss = 0.0
+        all_soz_preds = []
+        all_soz_labels = []
+        all_hemi_preds = []
+        all_hemi_labels = []
+    
 
-    with torch.no_grad():
-        if eeg_input.dim() == 3:
-            eeg_input = eeg_input.unsqueeze(0)
-        eeg_input = eeg_input.to(device)
+        patient_results = {}
 
-        soz_pred, hemi_pred = model(eeg_input)
+        with torch.no_grad():
+            for eeg_data, soz_labels, hemisphere_labels, patient_ids in val_loader:
+                eeg_data = eeg_data.to(device)
+                soz_labels = soz_labels.to(device)
+                hemisphere_labels = hemisphere_labels.to(device)
 
-    soz_probs = soz_pred.squeeze().cpu().numpy()
-    soz_channels = np.where(soz_probs > threshold)[0].tolist()
+                soz_pred, hemi_pred = model(eeg_data)
 
-    hemisphere_probs = torch.softmax(hemi_pred, dim=1).squeeze().cpu().numpy()
-    predicted_hemisphere = 0 if hemisphere_probs[0] > hemisphere_probs[1] else 1
+                loss_soz = criterion_soz(soz_pred, soz_labels)
+                loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels)
+                total_loss = 0.7 * loss_soz + 0.3 * loss_hemi
 
-    # channel in groups
-    left_channels = [0, 1, 2, 3, 8, 9, 10, 11]
-    right_channels = [4, 5, 6, 7, 12, 13, 14, 15]
+                val_loss += total_loss.item()
 
-    left_soz = [ch for ch in soz_channels if ch in left_channels]
-    right_soz = [ch for ch in soz_channels if ch in right_channels]
+                all_soz_preds.append(soz_pred.cpu())
+                all_soz_labels.append(soz_labels.cpu())
+                all_hemi_preds.append(hemi_pred.argmax(dim=1).cpu())
+                all_hemi_labels.append(hemisphere_labels.cpu())
+            
 
-    # dominant hemisphere
-    if len(left_soz) > len(right_soz):
-        dominant_hemisphere = "Left"
-    elif len(right_soz) > len(left_soz):
-        dominant_hemisphere = "Right"
-    else:
-        dominant_hemisphere = "Bilateral"
+                for i, patient_id in enumerate(patient_ids):
+                    if patient_id not in patient_results:
+                        patient_results[patient_id] = {
+                            'soz_preds': [],
+                            'soz_labels': [],
+                            'hemi_preds': [],
+                            'hemi_labels': []
+                        }
+                
+                    patient_results[patient_id]['soz_preds'].append(soz_pred[i].cpu())
+                    patient_results[patient_id]['soz_labels'].append(soz_labels[i].cpu())
+                    patient_results[patient_id]['hemi_preds'].append(hemi_pred[i].argmax().item())
+                    patient_results[patient_id]['hemi_labels'].append(hemisphere_labels[i].item())
 
-    # channel loc
-    channel_names = [
-        'Fp1-F7', 'F7-T3', 'T3-T5', 'T5-O1',  # 0-3
-        'Fp2-F8', 'F8-T4', 'T4-T6', 'T6-O2',  # 4-7
-        'Fp1-F3', 'F3-C3', 'C3-P3', 'P3-O1',  # 8-11
-        'Fp2-F4', 'F4-C4', 'C4-P4', 'P4-O2',  # 12-15
-        'Fz-Cz', 'Cz-Pz'  # 16-17
-    ]
+        val_loss /= len(val_loader)
 
-    result = {
-        'soz_channels': soz_channels,
-        'soz_channel_names': [channel_names[ch] for ch in soz_channels],
-        'soz_probabilities': soz_probs.tolist(),
-        'predicted_hemisphere': 'Left' if predicted_hemisphere == 0 else 'Right',
-        'hemisphere_probabilities': hemisphere_probs.tolist(),
-        'left_soz_channels': left_soz,
-        'right_soz_channels': right_soz,
-        'dominant_hemisphere': dominant_hemisphere,
-        'detailed_info': f"SOZ in{dominant_hemisphere}hemisphere，channel: {[channel_names[ch] for ch in soz_channels]}"
-    }
+ 
+        all_soz_preds = torch.cat(all_soz_preds).numpy()
+        all_soz_labels = torch.cat(all_soz_labels).numpy()
 
-    return result
+        channel_aucs = []
+        for ch in range(all_soz_preds.shape[1]):
+            try:
+                if np.sum(all_soz_labels[:, ch]) > 0: 
+                    auc = roc_auc_score(all_soz_labels[:, ch], all_soz_preds[:, ch])
+                    channel_aucs.append(auc)
+                else:
+                    channel_aucs.append(0.5)
+            except:
+                channel_aucs.append(0.5)
 
+        soz_auc = np.mean(channel_aucs) if channel_aucs else 0.5
+
+
+        all_hemi_preds = np.concatenate([np.array(preds) for preds in all_hemi_preds])
+        all_hemi_labels = np.concatenate([np.array(labels) for labels in all_hemi_labels])
+        hemi_acc = accuracy_score(all_hemi_labels, all_hemi_preds)
+    
+
+        print("\nValidation results by patient:")
+        print("-" * 60)
+        for patient_id, results in patient_results.items():
+            if patient_id in VALIDATION_PATIENTS:
+                info = VALIDATION_PATIENTS[patient_id]
+            
+
+                if results['hemi_labels']:
+                    patient_hemi_acc = np.mean(np.array(results['hemi_preds']) == np.array(results['hemi_labels']))
+                else:
+                    patient_hemi_acc = 0.0
+            
+                print(f"{patient_id}: {info['description']}")
+                print(f"  Ground truth: {info['hemisphere']} hemisphere")
+                print(f"  Hemisphere accuracy: {patient_hemi_acc:.4f}")
+                print(f"  SOZ channels: {info['soz_channels']}")
+    
+        return val_loss, soz_auc, hemi_acc
+
+    def plot_training_history(history):
+        """plotting training history"""
+        epochs = range(1, len(history['train_loss']) + 1)
+
+        plt.figure(figsize=(12, 4))
+
+        plt.subplot(1, 3, 1)
+        plt.plot(epochs, history['train_loss'], 'b-', label='Train Loss')
+        plt.plot(epochs, history['val_loss'], 'r-', label='Val Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training and Validation Loss')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        plt.subplot(1, 3, 2)
+        plt.plot(epochs, history['val_soz_auc'], 'g-', label='SOZ AUC')
+        plt.xlabel('Epoch')
+        plt.ylabel('AUC')
+        plt.title('SOZ Prediction AUC')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.ylim([0.4, 1.0])
+
+        plt.subplot(1, 3, 3)
+        plt.plot(epochs, history['val_hemi_acc'], 'm-', label='Hemisphere Acc')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.title('Hemisphere Classification Accuracy')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.ylim([0.4, 1.0])
+
+        plt.tight_layout()
+        plt.savefig('training_history.png', dpi=150, bbox_inches='tight')
+        plt.show()
+
+
+    def predict_soz_and_hemisphere(model, eeg_input, patient_id=None, threshold=0.5):
+        model.eval()
+        device = next(model.parameters()).device
+
+        with torch.no_grad():
+            if eeg_input.dim() == 3:
+                eeg_input = eeg_input.unsqueeze(0)
+            eeg_input = eeg_input.to(device)
+
+            soz_pred, hemi_pred = model(eeg_input)
+
+        soz_probs = soz_pred.squeeze().cpu().numpy()
+        soz_channels = np.where(soz_probs > threshold)[0].tolist()
+
+        hemisphere_probs = torch.softmax(hemi_pred, dim=1).squeeze().cpu().numpy()
+        predicted_hemisphere = 0 if hemisphere_probs[0] > hemisphere_probs[1] else 1
+
+
+        if patient_id and patient_id in VALIDATION_PATIENTS:
+            info = VALIDATION_PATIENTS[patient_id]
+            print(f"\nPatient {patient_id} - Ground truth:")
+            print(f"  Description: {info['description']}")
+            print(f"  Hemisphere: {info['hemisphere']}")
+            print(f"  SOZ channels: {info['soz_channels']}")
+            print(f"  Predicted hemisphere: {'left' if predicted_hemisphere == 0 else 'right'}")
+
+
+        left_channels = [0, 1, 2, 3, 8, 9, 10, 11]
+        right_channels = [4, 5, 6, 7, 12, 13, 14, 15]
+
+        left_soz = [ch for ch in soz_channels if ch in left_channels]
+        right_soz = [ch for ch in soz_channels if ch in right_channels]
+
+
+        if len(left_soz) > len(right_soz):
+            dominant_hemisphere = "Left"
+        elif len(right_soz) > len(left_soz):
+            dominant_hemisphere = "Right"
+        else:
+            dominant_hemisphere = "Bilateral"
+
+ 
+        channel_names = [
+            'Fp1-F7', 'F7-T3', 'T3-T5', 'T5-O1',  # 0-3
+            'Fp2-F8', 'F8-T4', 'T4-T6', 'T6-O2',  # 4-7
+            'Fp1-F3', 'F3-C3', 'C3-P3', 'P3-O1',  # 8-11
+            'Fp2-F4', 'F4-C4', 'C4-P4', 'P4-O2',  # 12-15
+            'Fz-Cz', 'Cz-Pz'  # 16-17
+        ]
+
+        result = {
+            'patient_id': patient_id,
+            'soz_channels': soz_channels,
+            'soz_channel_names': [channel_names[ch] for ch in soz_channels],
+            'soz_probabilities': soz_probs.tolist(),
+            'predicted_hemisphere': 'Left' if predicted_hemisphere == 0 else 'Right',
+            'hemisphere_probabilities': hemisphere_probs.tolist(),
+            'left_soz_channels': left_soz,
+            'right_soz_channels': right_soz,
+            'dominant_hemisphere': dominant_hemisphere,
+            'detailed_info': f"SOZ in {dominant_hemisphere} hemisphere, channels: {[channel_names[ch] for ch in soz_channels]}"
+        }
+
+        return result
+    
 
 if __name__ == "__main__":
     print("quick test for model")
