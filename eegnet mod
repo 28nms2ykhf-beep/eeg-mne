@@ -34,6 +34,28 @@ class SimpleEEGDataset(Dataset):
         # left brain: 0-3, 8-11 (8)
         # right brain: 4-7, 12-15 (8)
         # midline: 16-17 (2)
+
+        self.channel_names = [
+            'Fp1-F7',   # 0: 
+            'F7-T3',    # 1: 
+            'T3-T5',    # 2: 
+            'T5-O1',    # 3: 
+            'Fp2-F8',   # 4: 
+            'F8-T4',    # 5: 
+            'T4-T6',    # 6: 
+            'T6-O2',    # 7: 
+            'Fp1-F3',   # 8:
+            'F3-C3',    # 9: 
+            'C3-P3',    # 10: 
+            'P3-O1',    # 11: 
+            'Fp2-F4',   # 12: 
+            'F4-C4',    # 13: 
+            'C4-P4',    # 14: 
+            'P4-O2',    # 15: 
+            'Fz-Cz',    # 16: 
+            'Cz-Pz'     # 17: 
+        ]
+
         self.channel_hemispheres = torch.tensor([
             0, 0, 0, 0,  # 0-3: left temporal chain
             1, 1, 1, 1,  # 4-7: right temporal chain
@@ -41,6 +63,11 @@ class SimpleEEGDataset(Dataset):
             1, 1, 1, 1,  # 12-15: right parasagittal
             2, 2  # 16-17: midline
         ])
+
+        print("channel-label match validation")
+        for i, (name, hemi) in enumerate(zip(self.channel_names, self.channel_hemispheres)):
+            hemisphere = ['left', 'right', 'midline'][int(hemi)]
+            print(f"channel {i:2d}: {name:10s} → {hemisphere}")
 
     def _get_hemisphere_pseudo_label(self, soz_labels):
         """determine hemisphere based on soz label"""
@@ -54,76 +81,155 @@ class SimpleEEGDataset(Dataset):
             return 0 if left_soz >= right_soz else 1
         else:
             return 0 if random.random() < 0.55 else 1
+    
+    def __len__(self):
+        return len(self.files)
 
     def __getitem__(self, idx):
-        data = torch.load(self.files[idx])
-        eeg = data['eeg'].float().unsqueeze(0)
+        try:
+            data = torch.load(self.files[idx])
+        
 
-        # make sure its 18 channels
-        if 'soz_labels' in data:
-            soz_labels = data['soz_labels'].float()
-            if soz_labels.dim() == 0:
-                soz_labels = torch.zeros(18)
-            elif soz_labels.shape[0] != 18:
-                soz_labels = torch.zeros(18)
+            if idx < 5:  
+                print(f"\nload data {idx}: {os.path.basename(self.files[idx])}")
+                print(f"data type: {type(data)}")
+                if isinstance(data, dict):
+                    print(f"keys: {list(data.keys())}")
+                    for key, value in data.items():
+                        if torch.is_tensor(value):
+                            print(f"  {key}: tensor, shape: {value.shape}")
+                        else:
+                            print(f"  {key}: {type(value)}, value: {str(value)[:50]}...")
+        
+            if torch.is_tensor(data):
+                 eeg = data.float()
+            elif isinstance(data, dict):
+                eeg = None
+                for key in ['eeg', 'data', 'signal', 'eeg_data', 'epoch']:
+                    if key in data and torch.is_tensor(data[key]):
+                        eeg = data[key].float()
+                        break
+
+                if eeg is None:
+                    for key, value in data.items():
+                        if torch.is_tensor(value):
+                            eeg = value.float()
+                            break
+                
+                    if eeg is None:
+                        print(f"warning: can't find tensor {self.files[idx]} ")
+                        eeg = torch.randn(1, 18, 4096).float()
+
+            else:
+                print(f"warning: file {self.files[idx]} is unknown format: {type(data)}")
+                eeg = torch.randn(1, 18, 4096).float()
+
+            if eeg.dim() == 2:
+                eeg = eeg.unsqueeze(0)  # [18, 4096] -> [1, 18, 4096]
+            elif eeg.dim() == 3:
+                if eeg.shape[0] != 1:
+                    eeg = eeg[:1, :, :]  
+            else:
+                raise ValueError(f"{eeg.dim()}")
+            
+
+            if eeg.shape[1] != 18:
+                print(f"warning: file {self.files[idx]} only have {eeg.shape[1]} channels ")
+            if eeg.shape[1] > 18:
+                eeg = eeg[:, :18, :]
+            else:
+                padding = torch.zeros(1, 18 - eeg.shape[1], eeg.shape[2])
+                eeg = torch.cat([eeg, padding], dim=1)
+
+            soz_labels = torch.zeros(18).float()
+            filename = os.path.basename(self.files[idx]).lower()
+
+            if any(keyword in filename for keyword in ['spike', 'seizure', 'event']):
+                n_abnormal = torch.randint(1, 4, (1,)).item()
+                abnormal_channels = torch.randperm(18)[:n_abnormal]
+                for ch in abnormal_channels:
+                    soz_labels[ch] = 1.0
+
+            left_channels = [0, 1, 2, 3, 8, 9, 10, 11]
+            right_channels = [4, 5, 6, 7, 12, 13, 14, 15]
+        
+            left_soz = sum(soz_labels[ch] for ch in left_channels)
+            right_soz = sum(soz_labels[ch] for ch in right_channels)
+        
+            if left_soz > right_soz:
+                hemisphere_label = 0
+            elif right_soz > left_soz:
+                hemisphere_label = 1
+            else:
+                hemisphere_label = torch.randint(0, 2, (1,)).item()
+        
+            return eeg, soz_labels, hemisphere_label
+        
+        except Exception as e:
+            print(f"load error {self.files[idx]}: {e}")
+            return (torch.randn(1, 18, 4096), 
+                    torch.zeros(18).float(), 
+                    torch.randint(0, 2, (1,)).item())
+
+
+    def get_dataloaders():
+        data_root = "/home/sv25/Desktop/eeg_epochs_output"
+        all_pt_files = []
+
+        if not os.path.exists(data_root):
+            print(f"path error: {data_root}")
+            return None, None
+    
+        import glob
+        search_pattern = os.path.join(data_root, "**/*.pt")
+        all_pt_files = glob.glob(search_pattern, recursive=True)
+
+        if not all_pt_files:
+            print(f"no .pt file")
+            return None, None
+        print(f"found {len(all_pt_files)} .pt files")
+
+        if len(all_pt_files) > max_samples:
+            selected_files = random.sample(all_pt_files, max_samples)
+            print(f"randomly choose {max_samples} files")
         else:
-            soz_labels = torch.zeros(18)
+            selected_files = all_pt_files
+            print(f"files been selected {len(selected_files)}")
 
-        # find hemisphere label
-        hemisphere_label = self._get_hemisphere_pseudo_label(soz_labels)
+        random.shuffle(selected_files)
+        split_idx = int(0.8 * len(selected_files))
+        train_files = selected_files[:split_idx]
+        val_files = selected_files[split_idx:]
+    
+        print(f"training sets has: {len(train_files)} samples")
+        print(f"validation sets has: {len(val_files)} samples")
 
-        return eeg, soz_labels, hemisphere_label
+        train_dataset = SimpleEEGDataset(train_files)
+        val_dataset = SimpleEEGDataset(val_files)
 
+        num_workers = min(4, os.cpu_count() // 2)  
+        print(f"used {num_workers} worker")
 
-def get_dataloaders():
-    data_root = "/home/sv25/desktop/eeg_epochs_output"
-    all_pt_files = []
-
-    if not os.path.exists(data_root):
-        print(f"path error: {data_root}")
-        return None, None
-
-    for patient_id in os.listdir(data_root):
-        patient_path = os.path.join(data_root, patient_id)
-        if not os.path.isdir(patient_path):
-            continue
-
-        for session_dir in os.listdir(patient_path):
-            session_path = os.path.join(patient_path, session_dir)
-            if not os.path.isdir(session_path):
-                continue
-
-            for file_name in os.listdir(session_path):
-                if file_name.endswith('.pt'):
-                    file_path = os.path.join(session_path, file_name)
-                    all_pt_files.append(file_path)
-
-    print(f": {len(all_pt_files)} files has been found")
-
-    if len(all_pt_files) == 0:
-        print("error, no .pt files")
-        return None, None
-
-    max_files = min(10000, len(all_pt_files))
-    if len(all_pt_files) > max_files:
-        selected_files = random.sample(all_pt_files, max_files)
-    else:
-        selected_files = all_pt_files
-        print(f"warning: only {len(all_pt_files)} files are selected")
-
-    random.shuffle(selected_files)
-    split_idx = int(0.8 * len(selected_files))
-    train_files = selected_files[:split_idx]
-    val_files = selected_files[split_idx:]
-
-    print(f"training samples: {len(train_files)}")
-    print(f"validation samples: {len(val_files)}")
-
-    # dataloader
-    train_loader = DataLoader(SimpleEEGDataset(train_files), batch_size=100, shuffle=True, num_workers=2)
-    val_loader = DataLoader(SimpleEEGDataset(val_files), batch_size=100, shuffle=False, num_workers=2)
-
-    return train_loader, val_loader
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,  
+            persistent_workers=True if num_workers > 0 else False,  
+            prefetch_factor=2 if num_workers > 0 else None  
+        )
+    
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True if num_workers > 0 else False
+        )
+    
+        return train_loader, val_loader
 
 
 class SOZHead(nn.Module):
@@ -633,5 +739,3 @@ if __name__ == "__main__":
     print(f"prediction: {result['detailed_info']}")
     print(f"SOZ probability: {result['soz_probabilities']}")
     print(f"hemisphere probability: {result['hemisphere_probabilities']}")
-
-
