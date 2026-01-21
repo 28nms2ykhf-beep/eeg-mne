@@ -31,27 +31,32 @@ PATIENT_SOZ_INFO = {
     'patient_150009930': {
         'hemisphere': 'right', 
         'soz_channels': [4, 5, 6, 7, 12, 13, 14, 15],  
-        'dominant_channels': [5, 6, 13, 14]  
+        'dominant_channels': [5, 6, 13, 14],
+        'description': 'right temporal'
     },
     'patient_150017287': {
         'hemisphere': 'left',   
         'soz_channels': [0, 1, 2, 3, 8, 9, 10, 11],  
-        'dominant_channels': [0, 1, 8, 9]  
+        'dominant_channels': [0, 1, 8, 9],
+        'description': 'left frontotemporal'  
     },
     'patient_150008470': {
         'hemisphere': 'left',
         'soz_channels': [0, 1, 2, 3, 8, 9, 10, 11],  
-        'dominant_channels': [1, 2, 9, 10]  
+        'dominant_channels': [1, 2, 9, 10],
+        'description': 'left temporal and subtemporal chains'    
     },
     'patient_150003791': {
         'hemisphere': 'left',
         'soz_channels': [0, 1, 2, 3, 8, 9, 10, 11],  
-        'dominant_channels': [2, 3, 10, 11]  
+        'dominant_channels': [2, 3, 10, 11],  
+        'description': 'left posterior quadrants' 
     },
     'patient_150005601': {
         'hemisphere': 'left',
         'soz_channels': [0, 1, 2, 3, 8, 9, 10, 11],  
-        'dominant_channels': [0, 1, 2, 8, 9, 10]  
+        'dominant_channels': [0, 1, 2, 8, 9, 10],
+        'description': 'left temporal'   
     }
 }
 
