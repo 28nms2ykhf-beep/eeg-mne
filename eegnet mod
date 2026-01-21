@@ -226,7 +226,7 @@ class SimpleEEGDataset(Dataset):
         for patient_id in validation_patient_ids:
             if patient_id in PATIENT_SOZ_INFO:
                 info = PATIENT_SOZ_INFO[patient_id]
-                print(f"  {patient_id}: {info['description']} ({info['hemisphere']} hemisphere)")
+                print(f"  {patient_id}: {info['hemisphere']} hemisphere, SOZ channels: {info['soz_channels']}")
                 print(f"    SOZ channels: {info['soz_channels']}")
         
         train_dataset = SimpleEEGDataset(train_files)
