@@ -103,8 +103,8 @@ class SimpleEEGDataset(Dataset):
             self.patient_ids.append(patient_id)
 
         def _get_ground_truth_labels(self, patient_id):
-            if patient_id in VALIDATION_PATIENTS:
-                info = VALIDATION_PATIENTS[patient_id]
+            if patient_id in PATIENT_SOZ_INFO:
+                info = PATIENT_SOZ_INFO[patient_id]
                 soz_labels = torch.zeros(18)
                 soz_labels[info["soz_channels"]] = 1.0
             
@@ -188,7 +188,7 @@ class SimpleEEGDataset(Dataset):
         
         print(f"found {len(patient_files)} patients")
         
-        validation_patient_ids = list(VALIDATION_PATIENTS.keys())
+        validation_patient_ids = list(PATIENT_SOZ_INFO.keys())
         train_patient_ids = [pid for pid in patient_files.keys() if pid not in validation_patient_ids]
         
         print(f"validation patients: {validation_patient_ids}")
@@ -224,8 +224,8 @@ class SimpleEEGDataset(Dataset):
    
         print("\nValidation set ground truth:")
         for patient_id in validation_patient_ids:
-            if patient_id in VALIDATION_PATIENTS:
-                info = VALIDATION_PATIENTS[patient_id]
+            if patient_id in PATIENT_SOZ_INFO:
+                info = PATIENT_SOZ_INFO[patient_id]
                 print(f"  {patient_id}: {info['description']} ({info['hemisphere']} hemisphere)")
                 print(f"    SOZ channels: {info['soz_channels']}")
         
@@ -639,8 +639,8 @@ def validate_model(model, val_loader, criterion_soz, criterion_hemi, device):
     print("\nValidation results by patient:")
     print("-" * 60)
     for patient_id, results in patient_results.items():
-        if patient_id in VALIDATION_PATIENTS:
-            info = VALIDATION_PATIENTS[patient_id]
+        if patient_id in PATIENT_SOZ_INFO:
+            info = PATIENT_SOZ_INFO[patient_id]
             
 
             if results['hemi_labels']:
