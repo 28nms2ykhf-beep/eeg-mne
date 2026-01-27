@@ -552,14 +552,14 @@ def train_model(model, train_loader, val_loader, epochs=10, learning_rate=1e-3):
             hemisphere_labels = hemisphere_labels[has_label_mask].to(device)
             
             optimizer.zero_grad()
-            scaler=False
+    
             if scaler:
                 with torch.cuda.amp.autocast():
                     soz_pred, hemi_pred = model(eeg_data)
                     loss_soz = criterion_soz(soz_pred, soz_labels)
                     loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels)
                     total_loss = 0.8 * loss_soz + 0.2 * loss_hemi
-                
+
                 scaler.scale(total_loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -567,12 +567,12 @@ def train_model(model, train_loader, val_loader, epochs=10, learning_rate=1e-3):
                 scaler.update()
             else:
                 soz_pred, hemi_pred = model(eeg_data)
-                #loss_soz = criterion_soz(soz_pred, soz_labels)
+                loss_soz = criterion_soz(soz_pred, soz_labels)
                 print(hemi_pred.dtype,hemisphere_labels.unsqueeze(1).dtype)
-                
-                loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels.unsqueeze(1))
+                hemisphere_labels_float = hemisphere_labels.unsqueeze(1).float()
+                loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels_float)
                 print(loss_hemi)
-                #total_loss = 0.8 * loss_soz + 0.2 * loss_hemi
+                total_loss = 0.8 * loss_soz + 0.2 * loss_hemi
                 total_loss = loss_hemi
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -631,7 +631,7 @@ def validate_model(model, val_loader, criterion_soz, criterion_hemi, device):
             
             soz_pred, hemi_pred = model(eeg_data)
             loss_soz = criterion_soz(soz_pred, soz_labels)
-            loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels)
+            loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels.unsqueeze(1).float())
             total_loss = 0.7 * loss_soz + 0.3 * loss_hemi
 
             val_loss += total_loss.item()
@@ -639,7 +639,7 @@ def validate_model(model, val_loader, criterion_soz, criterion_hemi, device):
             
             all_soz_preds.append(soz_pred.cpu())
             all_soz_labels.append(soz_labels.cpu())
-            all_hemi_preds.append(hemi_pred.argmax(dim=1).cpu())
+            all_hemi_preds.append((hemi_pred.squeeze() > 0.5).float().cpu())
             all_hemi_labels.append(hemisphere_labels.cpu())
 
     if valid_samples > 0:
