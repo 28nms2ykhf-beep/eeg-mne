@@ -1,3 +1,21 @@
+"""this is an EEGnet modification in terms to suit
+    out task----predicting the seizure onset zone for
+    focal epilepsy patients.
+    we will make few modifications:
+An EEGNet PyTorch version optimized for SOZ localization
+
+Main modifications (optimized for your task):
+
+1. Output layer: Changed to multi-label output (one SOZ probability per channel)
+
+2. Feature dimensions: Adjusted according to your data (18 channels, 768 time points)
+
+3. Added auxiliary task: Left and right brain classification to help learn spatial features
+
+4. Added attention mechanism: Better focus on important channels and time points
+
+5. Adjusted convolutional kernel size: Adapted to your sampling rate (typically 200Hz)"""
+
 import os
 import random
 import torch
@@ -462,7 +480,6 @@ class EEGNetSOZ(nn.Module):
 
 
 def quick_test_model():
-    """quick model structure test"""
     batch_size = 4
     test_input = torch.randn(batch_size, 1, 18, 4096)
     model = EEGNetSOZ(Chans=18, Samples=4096)
@@ -507,9 +524,9 @@ def train_model(model, train_loader, val_loader, epochs=10, learning_rate=1e-4):
         train_loss = 0.0
 
         for batch_idx, (eeg_data, soz_labels, hemisphere_labels, patient_ids) in enumerate(train_loader):
-            eeg_data = eeg_data[mask].to(device)
-            soz_labels = soz_labels[mask].to(device)
-            hemisphere_labels = hemisphere_labels[mask].to(device)
+            eeg_data = eeg_data.to(device)
+            soz_labels = soz_labels.to(device)
+            hemisphere_labels = hemisphere_labels.to(device)
 
             has_soz_label_mask = (soz_labels.sum(dim=1) >= 0)
             has_hemi_label_mask = (hemisphere_labels >= 0)
@@ -740,15 +757,23 @@ def predict_soz_and_hemisphere(model, eeg_input, patient_id=None, threshold=0.5)
     device = next(model.parameters()).device
 
     with torch.no_grad():
-        if eeg_input.dim() == 3:
-            eeg_input = eeg_input.unsqueeze(0)
+        if eeg_input.dim() == 2:  # [channels, time]
+            eeg_input = eeg_input.unsqueeze(0).unsqueeze(0)  # [1, 1, channels, time]
+        elif eeg_input.dim() == 3:  # [batch, channels, time]
+            eeg_input = eeg_input.unsqueeze(1)  # [batch, 1, channels, time]
+
         eeg_input = eeg_input.to(device)
 
-        soz_pred, hemi_pred = model(eeg_input)
-
         soz_logits, hemi_logits = model(eeg_input)
-        soz_probs = torch.sigmoid(soz_logits).squeeze().cpu().numpy()
-        hemi_probs = torch.sigmoid(hemi_logits).squeeze().cpu().numpy()
+
+        soz_probs = torch.sigmoid(soz_logits).cpu().numpy()
+        hemi_probs = torch.sigmoid(hemi_logits).cpu().numpy()
+
+        soz_probs_flat = soz_probs.flatten()
+        soz_channels = np.where(soz_probs_flat > threshold)[0].tolist()
+
+        predicted_hemisphere = 0 if hemi_probs.mean() < 0.5 else 1
+        hemisphere_prob = hemi_probs.mean()
 
     if patient_id and patient_id in PATIENT_SOZ_INFO:
         info = PATIENT_SOZ_INFO[patient_id]
@@ -756,7 +781,8 @@ def predict_soz_and_hemisphere(model, eeg_input, patient_id=None, threshold=0.5)
         print(f"  Description: {info.get('description', 'N/A')}")
         print(f"  Hemisphere: {info['hemisphere']}")
         print(f"  SOZ channels: {info['soz_channels']}")
-        print(f"  Predicted hemisphere: {'left' if predicted_hemisphere == 0 else 'right'}")
+        print(
+            f"  Predicted hemisphere: {'left' if predicted_hemisphere == 0 else 'right'} (prob: {hemisphere_prob:.3f})")
 
     left_channels = [0, 1, 2, 3, 8, 9, 10, 11]
     right_channels = [4, 5, 6, 7, 12, 13, 14, 15]
@@ -782,14 +808,14 @@ def predict_soz_and_hemisphere(model, eeg_input, patient_id=None, threshold=0.5)
     result = {
         'patient_id': patient_id,
         'soz_channels': soz_channels,
-        'soz_channel_names': [channel_names[ch] for ch in soz_channels],
-        'soz_probabilities': soz_probs.tolist(),
+        'soz_channel_names': [channel_names[ch] for ch in soz_channels if ch < len(channel_names)],
+        'soz_probabilities': soz_probs_flat.tolist(),
         'predicted_hemisphere': 'Left' if predicted_hemisphere == 0 else 'Right',
-        'hemisphere_probabilities': hemisphere_probs.tolist(),
+        'hemisphere_probability': float(hemisphere_prob),
         'left_soz_channels': left_soz,
         'right_soz_channels': right_soz,
         'dominant_hemisphere': dominant_hemisphere,
-        'detailed_info': f"SOZ in {dominant_hemisphere} hemisphere, channels: {[channel_names[ch] for ch in soz_channels]}"
+        'detailed_info': f"SOZ in {dominant_hemisphere} hemisphere, channels: {[channel_names[ch] for ch in soz_channels if ch < len(channel_names)]}"
     }
 
     return result
