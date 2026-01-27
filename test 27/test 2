@@ -512,17 +512,7 @@ def train_model(model, train_loader, val_loader, epochs=10, learning_rate=1e-4):
     criterion_hemi = nn.BCEWithLogitsLoss()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-    history = {
-        'train_loss': [],
-        'val_loss': [],
-        'train_soz_auc': [],
-        'val_soz_auc': [],
-        'train_hemi_acc': [],
-        'val_hemi_acc': []
-    }
-
+  
     warmup_epochs = 2
     def warmup_scheduler(epoch):
         if epoch < warmup_epochs:
@@ -536,22 +526,29 @@ def train_model(model, train_loader, val_loader, epochs=10, learning_rate=1e-4):
     model.to(device)
     print(f"device: {device}")
 
-    scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
     
     for epoch in range(epochs):
         model.train()
         train_loss = 0.0
         
         for batch_idx, (eeg_data, soz_labels, hemisphere_labels, patient_ids) in enumerate(train_loader):
-            has_soz_label_mask = (soz_labels.sum(dim=1) >= 0)
-            has_hemi_label_mask = (hemisphere_labels >= 0)
-            if has_soz_label_mask.sum() == 0:
-                continue
-                
-            mask = has_soz_label_mask & has_hemi_label_mask
             eeg_data = eeg_data[mask].to(device)
             soz_labels = soz_labels[mask].to(device)
             hemisphere_labels = hemisphere_labels[mask].to(device)
+            
+            has_soz_label_mask = (soz_labels.sum(dim=1) >= 0)
+            has_hemi_label_mask = (hemisphere_labels >= 0)
+            valid_mask = has_soz_label_mask & has_hemi_label_mask
+            
+            if valid_mask.sum() == 0:
+                continue
+                
+            eeg_data_valid = eeg_data[valid_mask]
+            soz_labels_valid = soz_labels[valid_mask]
+            hemisphere_labels_valid = hemisphere_labels[valid_mask]
+
+            if hemisphere_labels_valid.dim == 0:
+                hemisphere_labels_valid = hemisphere_labels_valid.unsequeese(0)
             
             optimizer.zero_grad()
 
