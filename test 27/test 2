@@ -114,7 +114,7 @@ class SimpleEEGDataset(Dataset):
             info = PATIENT_SOZ_INFO[patient_id]
             soz_labels = torch.zeros(18)
             soz_labels[info["soz_channels"]] = 1.0
-            hemisphere_label = 0 if info["hemisphere"] == "left" else 1
+            hemisphere_label = 0.0 if info["hemisphere"] == "left" else 1.0
             return soz_labels, hemisphere_label, info.get("description", "")
         else:
             soz_labels = torch.zeros(18) * (-1)  
@@ -326,6 +326,7 @@ class AdaptiveNormalization(nn.Module):
 class EEGNetSOZ(nn.Module):
     def __init__(self, nb_classes=2, Chans=18, Samples=4096,
                  dropoutRate=0.3, kernLength=128, F1=8, D=2, F2=16,
+                 #instead of soz_channels, binary classification output.
                  dropoutType='Dropout', soz_channels=18):
         super(EEGNetSOZ, self).__init__()
 
@@ -402,7 +403,7 @@ class EEGNetSOZ(nn.Module):
         self.hemisphere_head = nn.Sequential(
             nn.Linear(self.flatten_dim, 64),
             nn.ELU(),
-            nn.Linear(64, 2)
+            nn.Linear(64,1)
         )
 
         self._initialize_weights()
@@ -507,8 +508,8 @@ def quick_test_model():
 
 
 def train_model(model, train_loader, val_loader, epochs=10, learning_rate=1e-3):
-    criterion_soz = nn.BCELoss()
-    criterion_hemi = nn.CrossEntropyLoss()
+    criterion_soz = nn.CrossEntropyLoss()
+    criterion_hemi = nn.BCELoss()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -551,7 +552,7 @@ def train_model(model, train_loader, val_loader, epochs=10, learning_rate=1e-3):
             hemisphere_labels = hemisphere_labels[has_label_mask].to(device)
             
             optimizer.zero_grad()
-            
+            scaler=False
             if scaler:
                 with torch.cuda.amp.autocast():
                     soz_pred, hemi_pred = model(eeg_data)
@@ -566,10 +567,13 @@ def train_model(model, train_loader, val_loader, epochs=10, learning_rate=1e-3):
                 scaler.update()
             else:
                 soz_pred, hemi_pred = model(eeg_data)
-                loss_soz = criterion_soz(soz_pred, soz_labels)
-                loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels)
-                total_loss = 0.8 * loss_soz + 0.2 * loss_hemi
+                #loss_soz = criterion_soz(soz_pred, soz_labels)
+                print(hemi_pred.dtype,hemisphere_labels.unsqueeze(1).dtype)
                 
+                loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels.unsqueeze(1))
+                print(loss_hemi)
+                #total_loss = 0.8 * loss_soz + 0.2 * loss_hemi
+                total_loss = loss_hemi
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -626,7 +630,6 @@ def validate_model(model, val_loader, criterion_soz, criterion_hemi, device):
             hemisphere_labels = hemisphere_labels[has_label_mask]
             
             soz_pred, hemi_pred = model(eeg_data)
-
             loss_soz = criterion_soz(soz_pred, soz_labels)
             loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels)
             total_loss = 0.7 * loss_soz + 0.3 * loss_hemi
