@@ -642,9 +642,9 @@ def validate_model(model, val_loader, criterion_soz, criterion_hemi, device):
             soz_pred, hemi_pred = model(eeg_data)
 
             loss_soz = criterion_soz(soz_pred, soz_labels)
-            loss_soz = loss_soz.mean
+            loss_soz = loss_soz.mean()
             loss_hemi = criterion_hemi(hemi_pred, hemisphere_labels.unsqueeze(1).float())
-            loss_hemi = loss_hemi.mean
+            loss_hemi = loss_hemi.mean()
             total_loss = 0.7 * loss_soz + 0.3 * loss_hemi
 
             val_loss += total_loss.item()
