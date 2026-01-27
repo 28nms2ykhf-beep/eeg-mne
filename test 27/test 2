@@ -564,7 +564,9 @@ def train_model(model, train_loader, val_loader, epochs=10, learning_rate=1e-4):
                 with torch.amp.autocast('cuda'):
                     soz_pred, hemi_pred = model(eeg_data)
                     loss_soz = criterion_soz(soz_pred, soz_labels_valid)
-                    weight_mask = (soz_labels >= 0).float()
+                    weight_mask = (soz_labels >= 0).float() 
+                    loss_soz = (loss_soz * weight_mask).sum() / weight_mask.sum()
+                    loss_soz = loss_soz.mean()
                     loss_hemi = criterion_hemi(hemi_pred.squeeze(), hemisphere_labels)
                     total_loss = 0.8 * loss_soz + 0.2 * loss_hemi
 
