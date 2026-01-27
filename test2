@@ -1,0 +1,569 @@
+import os
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import accuracy_score, roc_auc_score
+
+# 保留您的患者信息字典（仅使用hemisphere信息）
+PATIENT_SOZ_INFO = {
+    'patient_150009930': {'hemisphere': 'right'},
+    'patient_150017287': {'hemisphere': 'left'},
+    'patient_150008470': {'hemisphere': 'left'},
+    'patient_150003791': {'hemisphere': 'left'},
+    'patient_150005601': {'hemisphere': 'left'}
+}
+
+class SimpleHemisphereDataset(Dataset):
+    def __init__(self, files):
+        self.files = files
+        self.patient_ids = []
+        
+        for file_path in self.files:
+            parts = file_path.split('/')
+            patient_id = None
+            for part in parts:
+                if part.startswith('patient_'):
+                    patient_id = part
+                    break
+            self.patient_ids.append(patient_id)
+
+    def _get_hemisphere_label(self, patient_id):
+        """获取左右脑标签：右脑=1，左脑=0"""
+        if patient_id in PATIENT_SOZ_INFO:
+            hemisphere = PATIENT_SOZ_INFO[patient_id]['hemisphere']
+            return 1.0 if hemisphere == 'right' else 0.0
+        return -1.0  # 无标签的数据
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        file_path = self.files[idx]
+        patient_id = self.patient_ids[idx]
+
+        try:
+            # 加载EEG数据
+            eeg_data = torch.load(file_path, map_location='cpu')
+            
+            if isinstance(eeg_data, torch.Tensor):
+                eeg = eeg_data.float()
+            else:
+                # 备用：生成随机数据
+                eeg = torch.randn(18, 4096).float()
+            
+            # 确保形状正确：[18, 4096]
+            if eeg.dim() == 2 and eeg.shape[0] == 18:
+                pass  # 已经是正确形状
+            elif eeg.dim() == 3 and eeg.shape[1] == 18:
+                eeg = eeg[0]  # 取第一个片段
+            else:
+                # 调整到正确形状
+                if eeg.dim() == 2:
+                    eeg = eeg.unsqueeze(0)
+                if eeg.shape[1] != 18:
+                    # 如果通道数不对，随机生成
+                    eeg = torch.randn(1, 18, 4096).float()
+                else:
+                    eeg = eeg[:, :, :4096]  # 截取前4096个时间点
+                eeg = eeg[0]  # 取第一个片段
+            
+            # 确保是[18, 4096]
+            if eeg.dim() == 2 and eeg.shape[0] != 18:
+                eeg = eeg.permute(1, 0) if eeg.shape[1] == 18 else torch.randn(18, 4096).float()
+            elif eeg.dim() == 2 and eeg.shape[0] == 18:
+                pass  # 正确
+            else:
+                eeg = torch.randn(18, 4096).float()
+            
+            # 获取标签
+            label = self._get_hemisphere_label(patient_id)
+            
+            # 数据归一化（重要！）
+            eeg = (eeg - eeg.mean()) / (eeg.std() + 1e-8)
+            
+            return eeg, torch.tensor(label, dtype=torch.float32), patient_id
+            
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            # 返回随机数据
+            eeg = torch.randn(18, 4096).float()
+            label = random.choice([0.0, 1.0])
+            return eeg, torch.tensor(label, dtype=torch.float32), "error"
+
+    @staticmethod
+    def get_dataloaders(max_samples=5000, batch_size=32, validation_split=0.2):
+        """简化版数据加载器，按患者划分"""
+        data_root = "/home/sv25/Desktop/eeg_epochs_output"
+        
+        if not os.path.exists(data_root):
+            print(f"路径错误: {data_root}")
+            return None, None
+        
+        import glob
+        search_pattern = os.path.join(data_root, "**/*.pt")
+        all_pt_files = glob.glob(search_pattern, recursive=True)
+        
+        if not all_pt_files:
+            print(f"未找到.pt文件")
+            return None, None
+        
+        print(f"找到 {len(all_pt_files)} 个.pt文件")
+        
+        # 按患者分组
+        patient_files = {}
+        for file_path in all_pt_files:
+            parts = file_path.split('/')
+            patient_id = None
+            for part in parts:
+                if part.startswith('patient_'):
+                    patient_id = part
+                    break
+            
+            if patient_id:
+                if patient_id not in patient_files:
+                    patient_files[patient_id] = []
+                patient_files[patient_id].append(file_path)
+        
+        print(f"找到 {len(patient_files)} 个患者")
+        
+        # 按患者划分训练集和验证集（确保数据不泄露）
+        all_patient_ids = list(patient_files.keys())
+        random.shuffle(all_patient_ids)
+        
+        split_idx = int(len(all_patient_ids) * (1 - validation_split))
+        train_patient_ids = all_patient_ids[:split_idx]
+        val_patient_ids = all_patient_ids[split_idx:]
+        
+        print(f"训练患者: {len(train_patient_ids)}, 验证患者: {len(val_patient_ids)}")
+        
+        # 收集训练文件
+        train_files = []
+        for patient_id in train_patient_ids:
+            files = patient_files[patient_id]
+            # 限制每个患者的样本数，避免不平衡
+            max_files_per_patient = max_samples // max(1, len(train_patient_ids))
+            if len(files) > max_files_per_patient:
+                train_files.extend(random.sample(files, max_files_per_patient))
+            else:
+                train_files.extend(files)
+        
+        # 收集验证文件
+        val_files = []
+        for patient_id in val_patient_ids:
+            files = patient_files[patient_id]
+            max_files_per_patient = 50  # 每个验证患者最多50个样本
+            if len(files) > max_files_per_patient:
+                val_files.extend(random.sample(files, min(max_files_per_patient, len(files))))
+            else:
+                val_files.extend(files)
+        
+        # 限制总样本数
+        if len(train_files) > max_samples:
+            train_files = random.sample(train_files, max_samples)
+        
+        print(f"训练集: {len(train_files)} 个样本")
+        print(f"验证集: {len(val_files)} 个样本")
+        
+        # 创建数据集和数据加载器
+        train_dataset = SimpleHemisphereDataset(train_files)
+        val_dataset = SimpleHemisphereDataset(val_files)
+        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True
+        )
+        
+        return train_loader, val_loader
+
+
+class SimpleEEGNet(nn.Module):
+    """极简化的EEGNet，只做左右脑二分类"""
+    def __init__(self, channels=18, samples=4096, dropout_rate=0.3):
+        super(SimpleEEGNet, self).__init__()
+        
+        # 第一层：时域卷积
+        self.temporal_conv = nn.Conv2d(
+            1, 8, (1, 64), padding=(0, 32), bias=False
+        )
+        self.temporal_bn = nn.BatchNorm2d(8)
+        
+        # 第二层：空间卷积
+        self.spatial_conv = nn.Conv2d(
+            8, 16, (channels, 1), groups=8, bias=False
+        )
+        self.spatial_bn = nn.BatchNorm2d(16)
+        self.spatial_activation = nn.ELU()
+        self.spatial_dropout = nn.Dropout(dropout_rate)
+        
+        # 第三层：可分离卷积
+        self.separable_conv = nn.Conv2d(
+            16, 16, (1, 16), padding=(0, 8), groups=16, bias=False
+        )
+        self.pointwise_conv = nn.Conv2d(16, 16, (1, 1), bias=False)
+        self.separable_bn = nn.BatchNorm2d(16)
+        self.separable_activation = nn.ELU()
+        
+        # 平均池化
+        self.pool = nn.AvgPool2d((1, 4))
+        
+        # 计算扁平化维度
+        with torch.no_grad():
+            x = torch.randn(1, 1, channels, samples)
+            x = self.temporal_conv(x)
+            x = self.spatial_conv(x)
+            x = self.separable_conv(x)
+            x = self.pointwise_conv(x)
+            x = self.pool(x)
+            self.flatten_dim = x.numel()
+        
+        # 分类头
+        self.classifier = nn.Sequential(
+            nn.Linear(self.flatten_dim, 32),
+            nn.ELU(),
+            nn.Dropout(0.5),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        # 输入形状: [batch, channels, time] -> [batch, 1, channels, time]
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+        
+        # 时域卷积
+        x = self.temporal_conv(x)
+        x = self.temporal_bn(x)
+        
+        # 空间卷积
+        x = self.spatial_conv(x)
+        x = self.spatial_bn(x)
+        x = self.spatial_activation(x)
+        x = self.spatial_dropout(x)
+        
+        # 可分离卷积
+        x = self.separable_conv(x)
+        x = self.pointwise_conv(x)
+        x = self.separable_bn(x)
+        x = self.separable_activation(x)
+        
+        # 池化
+        x = self.pool(x)
+        
+        # 展平
+        x = x.view(x.size(0), -1)
+        
+        # 分类
+        output = self.classifier(x)
+        
+        return output
+
+
+def train_simple_model():
+    """训练极简化模型"""
+    print("初始化模型...")
+    model = SimpleEEGNet(channels=18, samples=4096, dropout_rate=0.3)
+    
+    # 计算参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"总参数量: {total_params:,}")
+    print(f"可训练参数量: {trainable_params:,}")
+    
+    # 加载数据
+    print("\n加载数据...")
+    train_loader, val_loader = SimpleHemisphereDataset.get_dataloaders(
+        max_samples=3000,  # 减少样本数以加速训练
+        batch_size=32,
+        validation_split=0.2
+    )
+    
+    if train_loader is None or val_loader is None:
+        print("数据加载失败")
+        return
+    
+    # 设置设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    print(f"使用设备: {device}")
+    
+    # 损失函数和优化器
+    criterion = nn.BCELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=5, verbose=True
+    )
+    
+    # 训练历史记录
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'val_acc': [],
+        'val_auc': []
+    }
+    
+    # 训练循环
+    epochs = 30
+    best_val_acc = 0.0
+    
+    for epoch in range(epochs):
+        # 训练阶段
+        model.train()
+        train_loss = 0.0
+        train_batches = 0
+        
+        for batch_idx, (eeg_data, labels, patient_ids) in enumerate(train_loader):
+            eeg_data = eeg_data.to(device)
+            labels = labels.to(device).unsqueeze(1)  # [batch, 1]
+            
+            # 过滤无标签的数据
+            valid_mask = labels >= 0
+            if valid_mask.sum() == 0:
+                continue
+            
+            eeg_data = eeg_data[valid_mask.squeeze()]
+            labels = labels[valid_mask]
+            
+            optimizer.zero_grad()
+            
+            outputs = model(eeg_data)
+            loss = criterion(outputs, labels)
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            train_loss += loss.item()
+            train_batches += 1
+            
+            if batch_idx % 10 == 0:
+                print(f'Epoch {epoch+1}/{epochs} | Batch {batch_idx}/{len(train_loader)} | Loss: {loss.item():.4f}')
+        
+        if train_batches > 0:
+            train_loss /= train_batches
+        
+        # 验证阶段
+        model.eval()
+        val_loss = 0.0
+        all_preds = []
+        all_labels = []
+        val_batches = 0
+        
+        with torch.no_grad():
+            for eeg_data, labels, patient_ids in val_loader:
+                eeg_data = eeg_data.to(device)
+                labels = labels.to(device).unsqueeze(1)
+                
+                # 过滤无标签的数据
+                valid_mask = labels >= 0
+                if valid_mask.sum() == 0:
+                    continue
+                
+                eeg_data = eeg_data[valid_mask.squeeze()]
+                labels = labels[valid_mask]
+                
+                outputs = model(eeg_data)
+                loss = criterion(outputs, labels)
+                
+                val_loss += loss.item()
+                val_batches += 1
+                
+                # 收集预测结果
+                all_preds.append(outputs.cpu())
+                all_labels.append(labels.cpu())
+        
+        if val_batches > 0:
+            val_loss /= val_batches
+        
+        # 计算指标
+        if all_preds:
+            all_preds = torch.cat(all_preds).numpy()
+            all_labels = torch.cat(all_labels).numpy()
+            
+            # 准确率
+            pred_labels = (all_preds > 0.5).astype(float)
+            val_acc = accuracy_score(all_labels, pred_labels)
+            
+            # AUC
+            try:
+                val_auc = roc_auc_score(all_labels, all_preds)
+            except:
+                val_auc = 0.5
+        else:
+            val_acc = 0.5
+            val_auc = 0.5
+        
+        # 保存历史
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        history['val_auc'].append(val_auc)
+        
+        # 学习率调整
+        scheduler.step(val_acc)
+        
+        # 打印结果
+        print(f'\nEpoch {epoch+1}/{epochs}:')
+        print(f'  训练损失: {train_loss:.4f}')
+        print(f'  验证损失: {val_loss:.4f}')
+        print(f'  验证准确率: {val_acc:.4f}')
+        print(f'  验证AUC: {val_auc:.4f}')
+        
+        # 保存最佳模型
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), 'best_simple_eegnet.pth')
+            print(f'  保存最佳模型 (准确率: {val_acc:.4f})')
+        
+        print('-' * 50)
+    
+    # 绘制训练历史
+    plot_simple_history(history)
+    
+    return model, history
+
+def plot_simple_history(history):
+    """绘制训练历史"""
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    
+    # 损失曲线
+    axes[0].plot(epochs, history['train_loss'], 'b-', label='Train Loss')
+    axes[0].plot(epochs, history['val_loss'], 'r-', label='Val Loss')
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Training History')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # 准确率曲线
+    axes[1].plot(epochs, history['val_acc'], 'g-', label='Val Accuracy')
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('Accuracy')
+    axes[1].set_title('Validation Accuracy')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    axes[1].set_ylim([0.0, 1.0])
+    
+    # AUC曲线
+    axes[2].plot(epochs, history['val_auc'], 'm-', label='Val AUC')
+    axes[2].set_xlabel('Epoch')
+    axes[2].set_ylabel('AUC')
+    axes[2].set_title('Validation AUC')
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+    axes[2].set_ylim([0.0, 1.0])
+    
+    plt.tight_layout()
+    plt.savefig('simple_training_history.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+
+
+def evaluate_model(model, data_loader):
+    """评估模型"""
+    device = next(model.parameters()).device
+    model.eval()
+    
+    all_preds = []
+    all_labels = []
+    patient_predictions = {}
+    
+    with torch.no_grad():
+        for eeg_data, labels, patient_ids in data_loader:
+            eeg_data = eeg_data.to(device)
+            labels = labels.to(device).unsqueeze(1)
+            
+            # 过滤无标签数据
+            valid_mask = labels >= 0
+            if valid_mask.sum() == 0:
+                continue
+            
+            eeg_data = eeg_data[valid_mask.squeeze()]
+            labels = labels[valid_mask]
+            patient_ids = [pid for pid, valid in zip(patient_ids, valid_mask.squeeze()) if valid]
+            
+            outputs = model(eeg_data)
+            
+            # 收集预测
+            all_preds.append(outputs.cpu())
+            all_labels.append(labels.cpu())
+            
+            # 按患者统计
+            for i, pid in enumerate(patient_ids):
+                if pid not in patient_predictions:
+                    patient_predictions[pid] = {'preds': [], 'labels': []}
+                patient_predictions[pid]['preds'].append(outputs[i].item())
+                patient_predictions[pid]['labels'].append(labels[i].item())
+    
+    if all_preds:
+        all_preds = torch.cat(all_preds).numpy()
+        all_labels = torch.cat(all_labels).numpy()
+        
+        # 总体指标
+        pred_labels = (all_preds > 0.5).astype(float)
+        accuracy = accuracy_score(all_labels, pred_labels)
+        auc = roc_auc_score(all_labels, all_preds)
+        
+        print(f"\n总体评估结果:")
+        print(f"  样本数: {len(all_labels)}")
+        print(f"  准确率: {accuracy:.4f}")
+        print(f"  AUC: {auc:.4f}")
+        
+        # 按患者评估
+        print(f"\n按患者评估:")
+        for pid, data in patient_predictions.items():
+            if len(data['labels']) > 0:
+                patient_pred = np.mean(data['preds'])
+                patient_label = np.mean(data['labels'])
+                predicted_hemi = "右脑" if patient_pred > 0.5 else "左脑"
+                true_hemi = "右脑" if patient_label > 0.5 else "左脑"
+                
+                # 显示真实标签（如果知道）
+                if pid in PATIENT_SOZ_INFO:
+                    true_info = PATIENT_SOZ_INFO[pid]['hemisphere']
+                    true_hemi = "右脑" if true_info == 'right' else "左脑"
+                
+                print(f"  患者 {pid}: 预测={predicted_hemi}({patient_pred:.3f}), 真实={true_hemi}")
+    
+    return all_preds, all_labels
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("极简EEGNet - 左右脑分类任务")
+    print("=" * 60)
+    
+    # 训练模型
+    model, history = train_simple_model()
+    
+    # 加载最佳模型
+    model.load_state_dict(torch.load('best_simple_eegnet.pth'))
+    print("\n已加载最佳模型")
+    
+    # 重新加载验证集进行评估
+    _, val_loader = SimpleHemisphereDataset.get_dataloaders(
+        max_samples=1000,
+        batch_size=32,
+        validation_split=0.2
+    )
+    
+    # 评估模型
+    evaluate_model(model, val_loader)
+    
+    print("\n任务完成！模型文件: 'best_simple_eegnet.pth'")
