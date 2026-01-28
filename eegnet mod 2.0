@@ -1,0 +1,1032 @@
+"""
+EEGNet for SOZ Localization - Clinical Version
+Modified for focal epilepsy seizure onset zone prediction with clinical annotations
+Author: DeepSeek Assistant
+Date: 2024-01-28
+"""
+
+import os
+import random
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix
+from sklearn.model_selection import StratifiedKFold
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==================== CONFIGURATION ====================
+class Config:
+    # Data paths
+    DATA_ROOT = "/home/sv25/Desktop/eeg_epochs_output"
+    ANNOTATION_CSV = "/path/to/your/test 28-01(Sheet1).csv"  # 修改为你的CSV路径
+    
+    # Training parameters
+    BATCH_SIZE = 64
+    EPOCHS = 50
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+    
+    # Data sampling
+    SAMPLES_PER_PATIENT = 500  # 每个病人抽取的样本数
+    MAX_TRAIN_SAMPLES = 20000  # 最大训练样本数
+    
+    # Model parameters
+    CHANS = 18
+    SAMPLES = 4096
+    DROPOUT_RATE = 0.3
+    
+    # Loss weights
+    SOZ_LOSS_WEIGHT = 0.7
+    HEMI_LOSS_WEIGHT = 0.3
+    
+    # Device
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Output
+    SAVE_DIR = "./eegnet_results"
+    
+    @classmethod
+    def setup_dirs(cls):
+        """创建输出目录"""
+        os.makedirs(cls.SAVE_DIR, exist_ok=True)
+        os.makedirs(f"{cls.SAVE_DIR}/models", exist_ok=True)
+        os.makedirs(f"{cls.SAVE_DIR}/plots", exist_ok=True)
+
+# ==================== ANNOTATION MANAGER ====================
+class AnnotationManager:
+    """管理病人级别的临床标注"""
+    
+    def __init__(self, csv_path):
+        self.csv_path = csv_path
+        self.annotations = {}
+        self._load_annotations()
+        
+    def _load_annotations(self):
+        """从CSV加载标注"""
+        try:
+            # 读取CSV文件
+            df = pd.read_csv(self.csv_path)
+            
+            # 找到训练集和验证集的分界
+            train_start = df[df.iloc[:, 0] == 'train'].index[0] + 1
+            val_start = df[df.iloc[:, 0] == 'validation'].index[0] + 1
+            
+            # 解析训练集
+            train_df = df.iloc[train_start:val_start-1]
+            val_df = df.iloc[val_start:]
+            
+            # 清理数据
+            train_df = train_df.dropna(subset=['Patient_ID'])
+            val_df = val_df.dropna(subset=['Patient_ID'])
+            
+            # 解析标注
+            self._parse_dataframe(train_df, 'train')
+            self._parse_dataframe(val_df, 'val')
+            
+            print(f"Loaded annotations: {len(self.annotations['train'])} train, {len(self.annotations['val'])} validation patients")
+            
+        except Exception as e:
+            print(f"Error loading annotations: {e}")
+            self.annotations = {'train': {}, 'val': {}}
+    
+    def _parse_dataframe(self, df, split):
+        """解析数据框中的标注"""
+        self.annotations[split] = {}
+        
+        for _, row in df.iterrows():
+            try:
+                patient_id = str(row['Patient_ID']).strip()
+                if not patient_id or pd.isna(patient_id):
+                    continue
+                    
+                # 解析SOZ通道
+                soz_str = str(row['SOZ_channels']).strip()
+                if soz_str.startswith('[') and soz_str.endswith(']'):
+                    soz_channels = eval(soz_str)
+                else:
+                    soz_channels = []
+                
+                # 解析位置
+                position = str(row['Position']).strip().upper()
+                
+                # 构建标注向量
+                soz_vector = torch.zeros(18)
+                for ch in soz_channels:
+                    if 0 <= ch < 18:
+                        soz_vector[ch] = 1.0
+                
+                # 位置到标签的映射
+                position_mapping = {'L': 0, 'R': 1, 'B': 2}
+                position_label = position_mapping.get(position, 3)  # 默认未知
+                
+                self.annotations[split][patient_id] = {
+                    'soz_vector': soz_vector,
+                    'position_label': position_label,
+                    'position_str': position,
+                    'soz_channels': soz_channels
+                }
+                
+            except Exception as e:
+                print(f"Error parsing row for patient {row.get('Patient_ID', 'unknown')}: {e}")
+                continue
+    
+    def get_annotation(self, patient_id, split='train'):
+        """获取病人的标注"""
+        return self.annotations[split].get(patient_id, {
+            'soz_vector': torch.zeros(18),
+            'position_label': 3,  # 未知
+            'position_str': 'U',
+            'soz_channels': []
+        })
+    
+    def get_all_patients(self, split='train'):
+        """获取所有病人ID"""
+        return list(self.annotations[split].keys())
+
+# ==================== DATASET ====================
+class ClinicalEEGDataset(Dataset):
+    """临床EEG数据集，使用病人级别标注"""
+    
+    def __init__(self, data_root, annotation_manager, split='train', 
+                 samples_per_patient=Config.SAMPLES_PER_PATIENT, transform=None):
+        self.data_root = data_root
+        self.annotation_manager = annotation_manager
+        self.split = split
+        self.samples_per_patient = samples_per_patient
+        self.transform = transform
+        self.samples = []  # (file_path, patient_id)
+        
+        self._collect_samples()
+        
+        if len(self.samples) > Config.MAX_TRAIN_SAMPLES and split == 'train':
+            self.samples = random.sample(self.samples, Config.MAX_TRAIN_SAMPLES)
+        
+        print(f"{split} dataset: {len(self.samples)} samples from {len(set([s[1] for s in self.samples]))} patients")
+    
+    def _collect_samples(self):
+        """收集样本，进行分层抽样"""
+        patient_ids = self.annotation_manager.get_all_patients(self.split)
+        
+        for patient_id in patient_ids:
+            patient_path = os.path.join(self.data_root, patient_id)
+            if not os.path.exists(patient_path):
+                print(f"Warning: Patient path not found: {patient_path}")
+                continue
+            
+            # 收集该病人所有.pt文件
+            patient_files = []
+            for session in os.listdir(patient_path):
+                session_path = os.path.join(patient_path, session)
+                if not os.path.isdir(session_path):
+                    continue
+                
+                for file_name in os.listdir(session_path):
+                    if file_name.endswith('.pt'):
+                        file_path = os.path.join(session_path, file_name)
+                        patient_files.append((file_path, patient_id))
+            
+            # 分层抽样
+            if len(patient_files) > self.samples_per_patient:
+                selected = random.sample(patient_files, self.samples_per_patient)
+            else:
+                selected = patient_files
+            
+            self.samples.extend(selected)
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        file_path, patient_id = self.samples[idx]
+        
+        try:
+            # 加载EEG数据
+            data = torch.load(file_path)
+            
+            # 确保数据形状正确 [1, 18, 4096]
+            if 'eeg' in data:
+                eeg = data['eeg'].float()
+            else:
+                # 尝试其他可能的键名
+                eeg_key = [k for k in data.keys() if 'eeg' in k.lower() or 'data' in k.lower()]
+                if eeg_key:
+                    eeg = data[eeg_key[0]].float()
+                else:
+                    # 默认为第一个张量
+                    eeg = list(data.values())[0].float()
+            
+            # 调整形状为 [1, 18, 4096]
+            if eeg.dim() == 2:
+                if eeg.shape[0] == 18:  # [18, 4096]
+                    eeg = eeg.unsqueeze(0)  # [1, 18, 4096]
+                elif eeg.shape[1] == 18:  # [1, 18] 或 [n, 18]
+                    eeg = eeg.unsqueeze(-1) if eeg.dim() == 2 else eeg
+            elif eeg.dim() == 3 and eeg.shape[1] != 18:
+                # 可能是 [1, 4096, 18]，需要转置
+                eeg = eeg.transpose(1, 2)
+            
+            # 确保最终形状
+            if eeg.shape[1] != 18:
+                # 尝试重新reshape
+                eeg = eeg.view(1, 18, -1)
+            
+            # 截断或填充到4096
+            if eeg.shape[2] > Config.SAMPLES:
+                eeg = eeg[:, :, :Config.SAMPLES]
+            elif eeg.shape[2] < Config.SAMPLES:
+                padding = Config.SAMPLES - eeg.shape[2]
+                eeg = F.pad(eeg, (0, padding))
+            
+            # 获取标注
+            annotation = self.annotation_manager.get_annotation(patient_id, self.split)
+            soz_label = annotation['soz_vector']
+            position_label = annotation['position_label']
+            
+            # 数据增强（可选）
+            if self.transform and self.split == 'train':
+                eeg = self.transform(eeg)
+            
+            return eeg, soz_label, position_label, patient_id
+            
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            # 返回空数据
+            return torch.randn(1, 18, Config.SAMPLES), torch.zeros(18), 3, patient_id
+
+# ==================== MODEL COMPONENTS ====================
+class SOZHead(nn.Module):
+    """SOZ预测头"""
+    
+    def __init__(self, input_dim, num_channels=18):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.fc3 = nn.Linear(128, num_channels)
+        
+        self.channel_interaction = nn.Parameter(torch.eye(num_channels) * 0.1)
+        self.elu = nn.ELU()
+        self.dropout = nn.Dropout(0.5)
+        
+        # 初始化
+        nn.init.normal_(self.fc1.weight, 0, 0.01)
+        nn.init.normal_(self.fc2.weight, 0, 0.01)
+        nn.init.normal_(self.fc3.weight, 0, 0.01)
+    
+    def forward(self, x):
+        residual = x
+        
+        x = self.elu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.elu(self.fc2(x))
+        x = self.dropout(x)
+        
+        if residual.shape[1] >= 128:
+            x = x + residual[:, :128]
+        
+        soz_logits = self.fc3(x)
+        soz_logits = soz_logits @ self.channel_interaction
+        
+        return torch.sigmoid(soz_logits)
+
+class FrequencyAttention(nn.Module):
+    """频域注意力"""
+    
+    def __init__(self, in_channels):
+        super().__init__()
+        self.freq_pool = nn.AdaptiveAvgPool2d((None, 1))
+        self.attention = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 8, 1),
+            nn.ELU(),
+            nn.Conv2d(in_channels // 8, in_channels, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        freq_weights = self.freq_pool(x)
+        freq_weights = self.attention(freq_weights)
+        return x * freq_weights
+
+class AdaptiveNormalization(nn.Module):
+    """自适应归一化"""
+    
+    def __init__(self, num_channels):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(1, 1, num_channels, 1))
+        self.beta = nn.Parameter(torch.zeros(1, 1, num_channels, 1))
+    
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True) + 1e-5
+        x_normalized = (x - mean) / std
+        return x_normalized * self.gamma + self.beta
+
+# ==================== MAIN MODEL ====================
+class EEGNetSOZClinical(nn.Module):
+    """临床版EEGNet，支持双侧和未知分类"""
+    
+    def __init__(self, Chans=18, Samples=4096, dropoutRate=0.3, 
+                 kernLength=128, F1=8, D=2, F2=16, num_positions=4):
+        super().__init__()
+        
+        self.Chans = Chans
+        self.Samples = Samples
+        
+        # 多尺度时间卷积
+        self.conv1_short = nn.Conv2d(1, F1 // 2, (1, 64), padding=(0, 32))
+        self.conv1_long = nn.Conv2d(1, F1 // 2, (1, 256), padding=(0, 128))
+        self.conv1_merge = nn.Conv2d(F1, F1, (1, 1))
+        self.batchnorm1 = nn.BatchNorm2d(F1)
+        
+        # 空间卷积
+        self.depthwise = nn.Conv2d(F1, F1 * D, (Chans, 1), groups=F1, bias=False)
+        self.batchnorm2 = nn.BatchNorm2d(F1 * D)
+        self.activation1 = nn.ELU()
+        
+        # 池化
+        self.pool1 = nn.Sequential(
+            nn.AvgPool2d((1, 2)),
+            nn.Conv2d(F1 * D, F1 * D, (1, 3), stride=(1, 2), padding=(0, 1))
+        )
+        
+        # 频域注意力
+        self.freq_attention = FrequencyAttention(F1 * D)
+        self.dropout1 = nn.Dropout2d(dropoutRate)
+        
+        # 可分离卷积
+        self.separable_depthwise = nn.Conv2d(F1 * D, F1 * D, (1, 16), 
+                                            padding=(0, 8), groups=F1 * D, bias=False)
+        self.separable_pointwise = nn.Conv2d(F1 * D, F2, (1, 1), bias=False)
+        self.batchnorm3 = nn.BatchNorm2d(F2)
+        self.activation2 = nn.ELU()
+        
+        # 池化2
+        self.pool2 = nn.Sequential(
+            nn.MaxPool2d((1, 4)),
+            nn.Dropout2d(0.3)
+        )
+        self.dropout2 = nn.Dropout(dropoutRate)
+        
+        # 时间注意力
+        self.time_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, None)),
+            nn.Conv2d(F2, F2 // 4, 1),
+            nn.ELU(),
+            nn.Conv2d(F2 // 4, F2, 1),
+            nn.Sigmoid()
+        )
+        
+        # 自适应归一化
+        self.adaptive_norm = AdaptiveNormalization(Chans)
+        
+        # 计算展平维度
+        self._calculate_flatten_dim()
+        
+        # SOZ预测头
+        self.soz_head = SOZHead(self.flatten_dim, Chans)
+        
+        # 位置分类头（4类：L, R, B, U）
+        self.position_head = nn.Sequential(
+            nn.Linear(self.flatten_dim, 128),
+            nn.ELU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, 64),
+            nn.ELU(),
+            nn.Linear(64, num_positions)
+        )
+        
+        # 位置编码（辅助模型理解空间关系）
+        self._register_position_encoding()
+        
+        # 初始化权重
+        self._initialize_weights()
+    
+    def _calculate_flatten_dim(self):
+        """计算展平后的维度"""
+        with torch.no_grad():
+            x = torch.randn(1, 1, self.Chans, self.Samples)
+            x = self.adaptive_norm(x)
+            
+            x_short = self.conv1_short(x)
+            x_long = self.conv1_long(x)
+            x = torch.cat([x_short, x_long], dim=1)
+            x = self.conv1_merge(x)
+            x = self.batchnorm1(x)
+            
+            x = self.depthwise(x)
+            x = self.batchnorm2(x)
+            x = self.activation1(x)
+            
+            x = self.pool1(x)
+            x = self.freq_attention(x)
+            x = self.dropout1(x)
+            
+            x = self.separable_depthwise(x)
+            x = self.separable_pointwise(x)
+            x = self.batchnorm3(x)
+            x = self.activation2(x)
+            
+            attention_weights = self.time_attention(x)
+            x = x * attention_weights
+            
+            x = self.pool2(x)
+            x = self.dropout2(x)
+            
+            self.flatten_dim = x.numel() // x.size(0)
+    
+    def _register_position_encoding(self):
+        """注册位置编码"""
+        # 左脑通道: 1, 右脑通道: 2, 中线: 0
+        position_encoding = torch.zeros(1, 1, self.Chans, 1)
+        left_channels = [0, 1, 2, 3, 8, 9, 10, 11]
+        right_channels = [4, 5, 6, 7, 12, 13, 14, 15]
+        
+        position_encoding[0, 0, left_channels, 0] = 1.0
+        position_encoding[0, 0, right_channels, 0] = 2.0
+        
+        self.register_buffer('position_encoding', position_encoding)
+    
+    def _initialize_weights(self):
+        """初始化权重"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x, return_features=False):
+        # 输入形状调整
+        if x.dim() == 3:
+            x = x.unsqueeze(1)  # [B, 1, C, T]
+        
+        # 添加位置编码
+        pos_enc = self.position_encoding.expand(x.size(0), -1, -1, -1)
+        x = x + pos_enc * 0.1
+        
+        # 自适应归一化
+        x = self.adaptive_norm(x)
+        
+        # 多尺度时间卷积
+        x_short = self.conv1_short(x)
+        x_long = self.conv1_long(x)
+        x = torch.cat([x_short, x_long], dim=1)
+        x = self.conv1_merge(x)
+        x = self.batchnorm1(x)
+        
+        # 空间卷积
+        x = self.depthwise(x)
+        x = self.batchnorm2(x)
+        x = self.activation1(x)
+        
+        # 池化1
+        x = self.pool1(x)
+        x = self.freq_attention(x)
+        x = self.dropout1(x)
+        
+        mid_features = x.clone() if return_features else None
+        
+        # 可分离卷积
+        x = self.separable_depthwise(x)
+        x = self.separable_pointwise(x)
+        x = self.batchnorm3(x)
+        x = self.activation2(x)
+        
+        # 时间注意力
+        attention_weights = self.time_attention(x)
+        x = x * attention_weights
+        
+        # 池化2
+        x = self.pool2(x)
+        x = self.dropout2(x)
+        
+        # 展平
+        x = x.view(x.size(0), -1)
+        
+        # SOZ预测
+        soz_pred = self.soz_head(x)
+        
+        # 位置预测
+        position_pred = self.position_head(x)
+        
+        if return_features:
+            return soz_pred, position_pred, mid_features
+        else:
+            return soz_pred, position_pred
+
+# ==================== LOSS FUNCTIONS ====================
+class FocalLossWithUncertainty(nn.Module):
+    """带不确定性的Focal Loss"""
+    
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        
+        if alpha is None:
+            self.alpha = torch.tensor([1.0, 1.0, 0.8, 0.5])  # L, R, B, U 的权重
+        else:
+            self.alpha = torch.tensor(alpha)
+    
+    def forward(self, inputs, targets):
+        # 将alpha移动到正确设备
+        self.alpha = self.alpha.to(inputs.device)
+        
+        # 计算交叉熵损失
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        
+        # 计算概率
+        pt = torch.exp(-ce_loss)
+        
+        # Focal Loss
+        focal_loss = self.alpha[targets] * (1 - pt) ** self.gamma * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+class WeightedBCELoss(nn.Module):
+    """加权BCE Loss，考虑类别不平衡"""
+    
+    def __init__(self, pos_weight=None):
+        super().__init__()
+        self.pos_weight = pos_weight
+    
+    def forward(self, inputs, targets):
+        if self.pos_weight is not None:
+            self.pos_weight = self.pos_weight.to(inputs.device)
+        
+        return F.binary_cross_entropy(inputs, targets, 
+                                      pos_weight=self.pos_weight,
+                                      reduction='mean')
+
+# ==================== TRAINING UTILITIES ====================
+def train_epoch(model, dataloader, optimizer, criterion_soz, criterion_pos, device):
+    """训练一个epoch"""
+    model.train()
+    train_loss = 0.0
+    soz_preds = []
+    soz_labels = []
+    pos_preds = []
+    pos_labels = []
+    
+    for batch_idx, (eeg, soz_label, pos_label, _) in enumerate(dataloader):
+        eeg = eeg.to(device)
+        soz_label = soz_label.to(device)
+        pos_label = pos_label.to(device)
+        
+        optimizer.zero_grad()
+        
+        # 前向传播
+        soz_pred, pos_pred = model(eeg)
+        
+        # 计算损失
+        loss_soz = criterion_soz(soz_pred, soz_label)
+        loss_pos = criterion_pos(pos_pred, pos_label)
+        
+        # 调整双侧样本的损失权重
+        bilateral_mask = (pos_label == 2)  # B=2
+        if bilateral_mask.any():
+            loss_soz_adjusted = loss_soz.clone()
+            # 双侧样本的SOZ损失权重降低
+            loss_soz_adjusted = loss_soz_adjusted * (1.0 - 0.3 * bilateral_mask.float())
+            total_loss = Config.SOZ_LOSS_WEIGHT * loss_soz_adjusted.mean() + Config.HEMI_LOSS_WEIGHT * loss_pos
+        else:
+            total_loss = Config.SOZ_LOSS_WEIGHT * loss_soz + Config.HEMI_LOSS_WEIGHT * loss_pos
+        
+        # 反向传播
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        # 统计
+        train_loss += total_loss.item()
+        soz_preds.append(soz_pred.detach().cpu())
+        soz_labels.append(soz_label.detach().cpu())
+        pos_preds.append(pos_pred.detach().argmax(dim=1).cpu())
+        pos_labels.append(pos_label.detach().cpu())
+        
+        if batch_idx % 20 == 0:
+            print(f"  Batch {batch_idx}/{len(dataloader)} - Loss: {total_loss.item():.4f}")
+    
+    # 计算指标
+    train_loss /= len(dataloader)
+    soz_preds = torch.cat(soz_preds).numpy()
+    soz_labels = torch.cat(soz_labels).numpy()
+    pos_preds = torch.cat(pos_preds).numpy()
+    pos_labels = torch.cat(pos_labels).numpy()
+    
+    # SOZ AUC
+    channel_aucs = []
+    for ch in range(soz_preds.shape[1]):
+        try:
+            auc = roc_auc_score(soz_labels[:, ch], soz_preds[:, ch])
+            channel_aucs.append(auc)
+        except:
+            channel_aucs.append(0.5)
+    soz_auc = np.mean(channel_aucs)
+    
+    # 位置准确率
+    pos_acc = accuracy_score(pos_labels, pos_preds)
+    
+    return train_loss, soz_auc, pos_acc
+
+def validate(model, dataloader, criterion_soz, criterion_pos, device):
+    """验证"""
+    model.eval()
+    val_loss = 0.0
+    soz_preds = []
+    soz_labels = []
+    pos_preds = []
+    pos_labels = []
+    patient_predictions = {}
+    
+    with torch.no_grad():
+        for eeg, soz_label, pos_label, patient_ids in dataloader:
+            eeg = eeg.to(device)
+            soz_label = soz_label.to(device)
+            pos_label = pos_label.to(device)
+            
+            # 前向传播
+            soz_pred, pos_pred = model(eeg)
+            
+            # 计算损失
+            loss_soz = criterion_soz(soz_pred, soz_label)
+            loss_pos = criterion_pos(pos_pred, pos_label)
+            total_loss = Config.SOZ_LOSS_WEIGHT * loss_soz + Config.HEMI_LOSS_WEIGHT * loss_pos
+            
+            val_loss += total_loss.item()
+            
+            # 收集预测
+            soz_preds.append(soz_pred.cpu())
+            soz_labels.append(soz_label.cpu())
+            pos_preds.append(pos_pred.argmax(dim=1).cpu())
+            pos_labels.append(pos_label.cpu())
+            
+            # 按病人收集预测
+            batch_patients = list(set(patient_ids))
+            for patient_id in batch_patients:
+                if patient_id not in patient_predictions:
+                    patient_predictions[patient_id] = {
+                        'soz_preds': [],
+                        'pos_preds': []
+                    }
+    
+    # 计算指标
+    val_loss /= len(dataloader)
+    soz_preds = torch.cat(soz_preds).numpy()
+    soz_labels = torch.cat(soz_labels).numpy()
+    pos_preds = torch.cat(pos_preds).numpy()
+    pos_labels = torch.cat(pos_labels).numpy()
+    
+    # SOZ AUC
+    channel_aucs = []
+    for ch in range(soz_preds.shape[1]):
+        try:
+            auc = roc_auc_score(soz_labels[:, ch], soz_preds[:, ch])
+            channel_aucs.append(auc)
+        except:
+            channel_aucs.append(0.5)
+    soz_auc = np.mean(channel_aucs)
+    
+    # 位置准确率
+    pos_acc = accuracy_score(pos_labels, pos_preds)
+    
+    # 位置混淆矩阵
+    pos_cm = confusion_matrix(pos_labels, pos_preds, labels=[0, 1, 2, 3])
+    
+    return val_loss, soz_auc, pos_acc, pos_cm, patient_predictions
+
+# ==================== TRAINING LOOP ====================
+def train_model(model, train_loader, val_loader, epochs=Config.EPOCHS):
+    """训练模型"""
+    # 损失函数
+    criterion_soz = WeightedBCELoss()
+    criterion_pos = FocalLossWithUncertainty()
+    
+    # 优化器
+    optimizer = torch.optim.AdamW(model.parameters(), 
+                                  lr=Config.LEARNING_RATE, 
+                                  weight_decay=Config.WEIGHT_DECAY)
+    
+    # 学习率调度器
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    
+    # 训练历史
+    history = {
+        'train_loss': [], 'val_loss': [],
+        'train_soz_auc': [], 'val_soz_auc': [],
+        'train_pos_acc': [], 'val_pos_acc': [],
+        'position_cm': []
+    }
+    
+    print(f"Starting training on {Config.DEVICE}")
+    print(f"Training samples: {len(train_loader.dataset)}")
+    print(f"Validation samples: {len(val_loader.dataset)}")
+    
+    best_val_auc = 0.0
+    patience_counter = 0
+    patience = 10
+    
+    for epoch in range(epochs):
+        print(f"\n{'='*60}")
+        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"{'='*60}")
+        
+        # 训练
+        train_loss, train_soz_auc, train_pos_acc = train_epoch(
+            model, train_loader, optimizer, criterion_soz, criterion_pos, Config.DEVICE
+        )
+        
+        # 验证
+        val_loss, val_soz_auc, val_pos_acc, pos_cm, _ = validate(
+            model, val_loader, criterion_soz, criterion_pos, Config.DEVICE
+        )
+        
+        # 更新学习率
+        scheduler.step()
+        
+        # 保存历史
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_soz_auc'].append(train_soz_auc)
+        history['val_soz_auc'].append(val_soz_auc)
+        history['train_pos_acc'].append(train_pos_acc)
+        history['val_pos_acc'].append(val_pos_acc)
+        history['position_cm'].append(pos_cm)
+        
+        # 打印结果
+        print(f"\nEpoch {epoch+1} Summary:")
+        print(f"  Train Loss: {train_loss:.4f}, SOZ AUC: {train_soz_auc:.4f}, Position Acc: {train_pos_acc:.4f}")
+        print(f"  Val Loss: {val_loss:.4f}, SOZ AUC: {val_soz_auc:.4f}, Position Acc: {val_pos_acc:.4f}")
+        print(f"  Position Confusion Matrix:\n{pos_cm}")
+        
+        # 早停和模型保存
+        if val_soz_auc > best_val_auc:
+            best_val_auc = val_soz_auc
+            patience_counter = 0
+            
+            # 保存最佳模型
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_soz_auc': val_soz_auc,
+                'val_pos_acc': val_pos_acc,
+            }, f"{Config.SAVE_DIR}/models/best_model.pth")
+            
+            print(f"  ✓ Saved best model with val SOZ AUC: {val_soz_auc:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"  Early stopping at epoch {epoch+1}")
+                break
+    
+    # 保存最终模型
+    torch.save(model.state_dict(), f"{Config.SAVE_DIR}/models/final_model.pth")
+    
+    return model, history
+
+# ==================== VISUALIZATION ====================
+def plot_training_history(history):
+    """绘制训练历史"""
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # 损失曲线
+    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train', linewidth=2)
+    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Validation', linewidth=2)
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].set_title('Training and Validation Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # SOZ AUC
+    axes[0, 1].plot(epochs, history['train_soz_auc'], 'b-', label='Train', linewidth=2)
+    axes[0, 1].plot(epochs, history['val_soz_auc'], 'r-', label='Validation', linewidth=2)
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('AUC')
+    axes[0, 1].set_title('SOZ Prediction AUC')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].set_ylim([0.4, 1.0])
+    
+    # 位置准确率
+    axes[0, 2].plot(epochs, history['train_pos_acc'], 'b-', label='Train', linewidth=2)
+    axes[0, 2].plot(epochs, history['val_pos_acc'], 'r-', label='Validation', linewidth=2)
+    axes[0, 2].set_xlabel('Epoch')
+    axes[0, 2].set_ylabel('Accuracy')
+    axes[0, 2].set_title('Position Classification Accuracy')
+    axes[0, 2].legend()
+    axes[0, 2].grid(True, alpha=0.3)
+    axes[0, 2].set_ylim([0.0, 1.0])
+    
+    # 最后epoch的混淆矩阵
+    if history['position_cm']:
+        cm = history['position_cm'][-1]
+        im = axes[1, 0].imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+        axes[1, 0].set_title('Position Confusion Matrix')
+        axes[1, 0].set_xticks([0, 1, 2, 3])
+        axes[1, 0].set_yticks([0, 1, 2, 3])
+        axes[1, 0].set_xticklabels(['L', 'R', 'B', 'U'])
+        axes[1, 0].set_yticklabels(['L', 'R', 'B', 'U'])
+        axes[1, 0].set_xlabel('Predicted')
+        axes[1, 0].set_ylabel('True')
+        
+        # 添加文本
+        thresh = cm.max() / 2.
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                axes[1, 0].text(j, i, format(cm[i, j], 'd'),
+                              ha="center", va="center",
+                              color="white" if cm[i, j] > thresh else "black")
+    
+    # SOZ通道重要性（最后一个batch的平均预测）
+    axes[1, 1].bar(range(18), np.mean(history['val_soz_auc'] if history['val_soz_auc'] else [0]*18, axis=0))
+    axes[1, 1].set_xlabel('Channel')
+    axes[1, 1].set_ylabel('Average SOZ Probability')
+    axes[1, 1].set_title('Channel-wise SOZ Importance')
+    axes[1, 1].set_xticks(range(18))
+    axes[1, 1].set_xticklabels(range(18), rotation=45)
+    
+    # 学习率曲线（如果有的话）
+    axes[1, 2].axis('off')
+    axes[1, 2].text(0.5, 0.5, 'Training Complete\nCheck model predictions', 
+                   ha='center', va='center', fontsize=12)
+    
+    plt.tight_layout()
+    plt.savefig(f"{Config.SAVE_DIR}/plots/training_history.png", dpi=150, bbox_inches='tight')
+    plt.show()
+
+# ==================== PREDICTION ====================
+def predict_soz_and_position(model, eeg_input, threshold=0.5):
+    """预测SOZ和位置"""
+    model.eval()
+    device = next(model.parameters()).device
+    
+    with torch.no_grad():
+        if eeg_input.dim() == 3:
+            eeg_input = eeg_input.unsqueeze(0)
+        eeg_input = eeg_input.to(device)
+        
+        soz_pred, pos_pred = model(eeg_input)
+    
+    # SOZ预测
+    soz_probs = soz_pred.squeeze().cpu().numpy()
+    soz_channels = np.where(soz_probs > threshold)[0].tolist()
+    
+    # 位置预测
+    pos_probs = F.softmax(pos_pred, dim=1).squeeze().cpu().numpy()
+    pos_label = np.argmax(pos_probs)
+    pos_mapping = {0: 'Left', 1: 'Right', 2: 'Bilateral', 3: 'Unknown'}
+    predicted_position = pos_mapping.get(pos_label, 'Unknown')
+    
+    # 通道分组
+    channel_names = [
+        'Fp1-F7', 'F7-T3', 'T3-T5', 'T5-O1',
+        'Fp2-F8', 'F8-T4', 'T4-T6', 'T6-O2',
+        'Fp1-F3', 'F3-C3', 'C3-P3', 'P3-O1',
+        'Fp2-F4', 'F4-C4', 'C4-P4', 'P4-O2',
+        'Fz-Cz', 'Cz-Pz'
+    ]
+    
+    left_channels = [0, 1, 2, 3, 8, 9, 10, 11]
+    right_channels = [4, 5, 6, 7, 12, 13, 14, 15]
+    
+    left_soz = [ch for ch in soz_channels if ch in left_channels]
+    right_soz = [ch for ch in soz_channels if ch in right_channels]
+    
+    # 主导半球
+    if len(left_soz) > len(right_soz):
+        dominant_hemisphere = "Left"
+    elif len(right_soz) > len(left_soz):
+        dominant_hemisphere = "Right"
+    else:
+        dominant_hemisphere = "Bilateral"
+    
+    result = {
+        'soz_channels': soz_channels,
+        'soz_channel_names': [channel_names[ch] for ch in soz_channels],
+        'soz_probabilities': soz_probs.tolist(),
+        'predicted_position': predicted_position,
+        'position_probabilities': pos_probs.tolist(),
+        'left_soz_channels': left_soz,
+        'right_soz_channels': right_soz,
+        'dominant_hemisphere': dominant_hemisphere,
+        'detailed_info': f"Predicted {predicted_position} SOZ. Dominant hemisphere: {dominant_hemisphere}. Channels: {[channel_names[ch] for ch in soz_channels]}"
+    }
+    
+    return result
+
+# ==================== MAIN ====================
+def main():
+    """主函数"""
+    print("EEGNet for SOZ Localization - Clinical Version")
+    print("=" * 60)
+    
+    # 设置目录
+    Config.setup_dirs()
+    
+    # 加载标注
+    print("\n1. Loading clinical annotations...")
+    annotation_manager = AnnotationManager(Config.ANNOTATION_CSV)
+    
+    # 创建数据集
+    print("\n2. Creating datasets...")
+    train_dataset = ClinicalEEGDataset(
+        Config.DATA_ROOT, annotation_manager, split='train'
+    )
+    val_dataset = ClinicalEEGDataset(
+        Config.DATA_ROOT, annotation_manager, split='val'
+    )
+    
+    # 创建数据加载器
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=Config.BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=4,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=Config.BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    # 创建模型
+    print("\n3. Creating model...")
+    model = EEGNetSOZClinical(
+        Chans=Config.CHANS,
+        Samples=Config.SAMPLES,
+        dropoutRate=Config.DROPOUT_RATE
+    ).to(Config.DEVICE)
+    
+    # 打印模型信息
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,}")
+    
+    # 快速测试
+    print("\n4. Quick model test...")
+    test_input = torch.randn(2, 1, Config.CHANS, Config.SAMPLES).to(Config.DEVICE)
+    soz_pred, pos_pred = model(test_input)
+    print(f"  Input shape: {test_input.shape}")
+    print(f"  SOZ prediction shape: {soz_pred.shape}")
+    print(f"  Position prediction shape: {pos_pred.shape}")
+    
+    # 训练
+    print("\n5. Starting training...")
+    trained_model, history = train_model(model, train_loader, val_loader)
+    
+    # 绘制结果
+    print("\n6. Plotting results...")
+    plot_training_history(history)
+    
+    # 保存历史
+    np.save(f"{Config.SAVE_DIR}/training_history.npy", history)
+    
+    # 测试预测
+    print("\n7. Testing predictions...")
+    test_eeg = torch.randn(1, Config.CHANS, Config.SAMPLES)
+    result = predict_soz_and_position(trained_model, test_eeg)
+    
+    print(f"\nTest prediction:")
+    print(f"  SOZ channels: {result['soz_channels']}")
+    print(f"  Position: {result['predicted_position']}")
+    print(f"  Dominant hemisphere: {result['dominant_hemisphere']}")
+    print(f"  Details: {result['detailed_info']}")
+    
+    print("\n" + "=" * 60)
+    print("Training completed successfully!")
+    print(f"Results saved to: {Config.SAVE_DIR}")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    # 设置随机种子
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+    
+    main()
