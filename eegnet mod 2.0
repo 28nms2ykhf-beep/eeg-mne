@@ -285,9 +285,6 @@ class SOZHead(nn.Module):
         
         soz_logits = self.fc3(x)
         soz_logits = soz_logits @ self.channel_interaction
-
-        soz_probs = torch.sigmoid(soz_logits)
-        soz_probs = torch.clamp(soz_probs, 1e-8, 1.0 - 1e-8)
         
         return soz_logits
 
@@ -407,7 +404,6 @@ class EEGNetSOZClinical(nn.Module):
         """计算展平后的维度"""
         with torch.no_grad():
             x = torch.randn(1, 1, self.Chans, self.Samples)
-            x = self.adaptive_norm(x)
             
             x_short = self.conv1_short(x)
             x_long = self.conv1_long(x)
@@ -523,7 +519,7 @@ class EEGNetSOZClinical(nn.Module):
             return soz_pred, position_pred
 
 # ==================== LOSS FUNCTIONS ====================
-class FocalLossWithUncertainty(nn.Module):
+class FocalLossWithUncertaintyFixed(nn.Module):
     """带不确定性的Focal Loss"""
     
     def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
@@ -532,22 +528,17 @@ class FocalLossWithUncertainty(nn.Module):
         self.reduction = reduction
         
         if alpha is None:
-            self.alpha = torch.tensor([1.0, 1.0, 0.8, 0.5])  # L, R, B, U 的权重
-        else:
-            self.alpha = torch.tensor(alpha)
+            alpha = [1.0, 1.0, 0.8, 0.5] # L, R, B, U 的权重
+        self.register_buffer('alpha', torch.tensor(alpha))
     
     def forward(self, inputs, targets):
-        # 将alpha移动到正确设备
-        self.alpha = self.alpha.to(inputs.device)
-        
-        # 计算交叉熵损失
         ce_loss = F.cross_entropy(inputs, targets, reduction='none')
-        
-        # 计算概率
+
         pt = torch.exp(-ce_loss)
-        
-        # Focal Loss
-        focal_loss = self.alpha[targets] * (1 - pt) ** self.gamma * ce_loss
+
+        alpha_weighted = self.alpha[targets]
+
+        focal_loss = alpha_weighted * (1 - pt) ** self.gamma * ce_loss
         
         if self.reduction == 'mean':
             return focal_loss.mean()
@@ -556,12 +547,12 @@ class FocalLossWithUncertainty(nn.Module):
         else:
             return focal_loss
 
-class WeightedBCEWithLogitsLoss(nn.Module):
+class StableBCEWithLogitsLoss(nn.Module):
     """加权BCE Loss，考虑类别不平衡"""
     
     def __init__(self):
         super().__init__()
-
+        self.reduction = reduction
     
     def forward(self, inputs, targets):
         return F.binary_cross_entropy(inputs, targets, reduction='mean')
@@ -707,8 +698,8 @@ def validate(model, dataloader, criterion_soz, criterion_pos, device):
 def train_model(model, train_loader, val_loader, epochs=Config.EPOCHS):
     """训练模型"""
     # 损失函数
-    criterion_soz = WeightedBCEWithLogitsLoss()
-    criterion_pos = FocalLossWithUncertainty()
+    criterion_soz = nn.BCEWithLogitsLoss()
+    criterion_pos = nn.CrossEntropyLoss()
     
     # 优化器
     optimizer = torch.optim.AdamW(model.parameters(), 
@@ -731,13 +722,10 @@ def train_model(model, train_loader, val_loader, epochs=Config.EPOCHS):
     print(f"Validation samples: {len(val_loader.dataset)}")
     
     best_val_auc = 0.0
-    patience_counter = 0
-    patience = 10
     
     for epoch in range(epochs):
         print(f"\n{'='*60}")
         print(f"Epoch {epoch+1}/{epochs}")
-        print(f"{'='*60}")
         
         # 训练
         train_loss, train_soz_auc, train_pos_acc = train_epoch(
