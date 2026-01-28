@@ -23,7 +23,7 @@ warnings.filterwarnings('ignore')
 class Config:
     # Data paths
     DATA_ROOT = "/home/sv25/Desktop/eeg_epochs_output"
-    ANNOTATION_CSV = "/path/to/your/test 28-01(Sheet1).csv"  # 修改为你的CSV路径
+    ANNOTATION_CSV = "/home/sv25/Desktop/test 28-01(Sheet1).csv"  # 修改为你的CSV路径
     
     # Training parameters
     BATCH_SIZE = 64
