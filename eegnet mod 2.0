@@ -230,7 +230,6 @@ class ClinicalEEGDataset(Dataset):
             
         except Exception as e:
             print(f"Error loading {file_path}: {e}")
-            # 返回空数据
             return torch.randn(1, 18, Config.SAMPLES), torch.zeros(18), 3, patient_id
 
 # ==================== MODEL COMPONENTS ====================
