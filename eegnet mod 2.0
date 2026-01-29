@@ -16,8 +16,7 @@ warnings.filterwarnings('ignore')
 class Config:
     # Data paths
     DATA_ROOT = "/home/sv25/Desktop/eeg_epochs_output"
-    ANNOTATION_CSV = "/home/sv25/Desktop/test 28-01(Sheet1).csv"  # 修改为你的CSV路径
-    
+    ANNOTATION_CSV = "/home/sv25/Desktop/test 28-01(Sheet1).csv" 
     # Training parameters
     BATCH_SIZE = 64
     EPOCHS = 50
@@ -468,7 +467,7 @@ class FocalLossWithUncertaintyFixed(nn.Module):
         self.reduction = reduction
         
         if alpha is None:
-            alpha = [1.0, 1.0, 0.8, 0.5] # L, R, B, U 的权重
+            alpha = [1.0, 1.0, 0.8, 0.5] # L, R, B, U weight
         self.register_buffer('alpha', torch.tensor(alpha))
     
     def forward(self, inputs, targets):
