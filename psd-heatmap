@@ -3,33 +3,33 @@ import glob
 import mne
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.signal import welch
 from mne.channels import make_standard_montage
 from mne.channels import find_layout
 
 
-PATIENT_IDS = ["150013786"]  
-SESSIONS_TO_PROCESS = ["ses-5"]  
-BASE_PATH = "/home/sv25/Desktop/eeg_files+annotations"  
-OUTPUT_BASE_DIR = "/home/sv25/Desktop/eeg_heatmaps_output"  
+PATIENT_IDS = ["150013786"]
+SESSIONS_TO_PROCESS = ["ses-5"]
+BASE_PATH = "/home/sv25/Desktop/eeg_files+annotations"
+OUTPUT_BASE_DIR = "/home/sv25/Desktop/eeg_heatmaps_output"
 
 
-L_FREQ = 0.3       
-H_FREQ = 70        
-NOTCH_FREQ = 60    
-TARGET_SFREQ = 256 
+L_FREQ = 0.3
+H_FREQ = 70
+NOTCH_FREQ = 60
+TARGET_SFREQ = 256
 
 
-FMIN = 1.0        
-FMAX = 45.0        
-BANDWIDTH = 2.0    
-WINDOW_SEC = 4.0   
-OVERLAP = 0.5     
+FMIN = 1.0
+FMAX = 45.0
+BANDWIDTH = 2.0
+WINDOW_SEC = 4.0
+OVERLAP = 0.5
 
-GRID_SIZE = (64, 64)  
-INTERPOLATION = 'cubic'  
+GRID_SIZE = (64, 64)
+INTERPOLATION = 'cubic'
 
 def create_longitudinal_bipolar_montage(raw):
     bipolar_pairs = [
@@ -70,10 +70,7 @@ def create_longitudinal_bipolar_montage(raw):
 
 def get_bipolar_electrode_positions():
     montage = make_standard_montage('standard_1020')
-    pos_dict = montage.get_positions()['ch_pos']  
-    layout = mne.channels.find_layout(montage, ch_type='eeg')
-    ch_names = layout.names
-    pos_2d = {name: layout.pos[i, :2] for i, name in enumerate(ch_names) if name in layout.names}
+    pos_dict = montage.get_positions()['ch_pos']  # {ch_name: (x,y,z) in meters}
 
     pairs = [
         ('Fp1', 'F7', 'Fp1-F7'),
@@ -95,13 +92,42 @@ def get_bipolar_electrode_positions():
         ('Fz', 'Cz', 'Fz-Cz'),
         ('Cz', 'Pz', 'Cz-Pz'),
     ]
-    bipolar_pos = {}
-    for ch1, ch2, ch_name in pairs:
-        if ch1 in pos_2d and ch2 in pos_2d:
-            mid = (pos_2d[ch1] + pos_2d[ch2]) / 2
-            bipolar_pos[ch_name] = mid
+
+    needed_electrodes = set()
+    for ch1, ch2, _ in pairs:
+        needed_electrodes.add(ch1)
+        needed_electrodes.add(ch2)
+
+    coords_xy = {}
+    all_x = []
+    all_y = []
+    for ch in needed_electrodes:
+        if ch in pos_dict:
+            x, y, z = pos_dict[ch]  
+            coords_xy[ch] = np.array([x, y])
+            all_x.append(x)
+            all_y.append(y)
         else:
-            bipolar_pos[ch_name] = np.array([0.5, 0.5])
+            print(f"Warning: electrode {ch} not found in standard montage")
+            coords_xy[ch] = np.array([0.0, 0.0])
+
+    if all_x and all_y:
+        min_x, max_x = min(all_x), max(all_x)
+        min_y, max_y = min(all_y), max(all_y)
+        range_x = max_x - min_x if max_x > min_x else 1.0
+        range_y = max_y - min_y if max_y > min_y else 1.0
+        for ch in coords_xy:
+            x_norm = (coords_xy[ch][0] - min_x) / range_x
+            y_norm = (coords_xy[ch][1] - min_y) / range_y
+            coords_xy[ch] = np.array([x_norm, y_norm])
+
+    bipolar_pos = {}
+    for ch1, ch2, bipolar_name in pairs:
+        if ch1 in coords_xy and ch2 in coords_xy:
+            mid = (coords_xy[ch1] + coords_xy[ch2]) / 2
+            bipolar_pos[bipolar_name] = mid
+        else:
+            bipolar_pos[bipolar_name] = np.array([0.5, 0.5])
     return bipolar_pos
 
 
@@ -194,16 +220,16 @@ def process_session(patient_id, session, edf_path, output_dir):
 
     bipolar_pos = get_bipolar_electrode_positions()
 
-    heatmaps = [] 
+    heatmaps = []
     for i, (low, high) in enumerate(bands):
         band_name = f"{low:.1f}-{high:.1f}"
-        powers = band_powers[:, i]  
+        powers = band_powers[:, i]
 
         # img_path = os.path.join(output_dir, f"heatmap_{band_name}.png")
         heatmap = generate_topomap(
             powers, ch_names, bipolar_pos,
             grid_size=GRID_SIZE, freq_band_name=band_name,
-            output_image=None  
+            output_image=None
         )
         heatmaps.append(heatmap)
 
