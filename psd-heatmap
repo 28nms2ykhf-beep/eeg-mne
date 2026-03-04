@@ -180,7 +180,11 @@ def save_topomap_image(values, ch_names, bipolar_pos, freq_band_name, output_pat
     if len(ch_pos) < 3:
         print(f"Not enough channels for topomap: {len(ch_pos)}")
         return
-    montage = mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame='head')
+
+    # Convert 2D positions to 3D (add z=0)
+    ch_pos_3d = {name: np.array([pos[0], pos[1], 0.0]) for name, pos in ch_pos.items()}
+    montage = mne.channels.make_dig_montage(ch_pos=ch_pos_3d, coord_frame='head')
+
     info = mne.create_info(list(ch_pos.keys()), sfreq=256, ch_types='eeg')
     info.set_montage(montage)
 
