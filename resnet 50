@@ -44,23 +44,23 @@ def load_labels(csv_path):
             patient = str(int(float(patient_raw)))
         except ValueError:
             patient = patient_raw
-            session = str(row['session']).strip()
-            pos = str(row['position']).strip().upper()
-            if pos == 'L':
-                label = 0
-            elif pos == 'R':
-                label = 1
-            else:
-                continue
+        session = str(row['session']).strip()
+        pos = str(row['position']).strip().upper()
+        if pos == 'L':
+            label = 0
+        elif pos == 'R':
+            label = 1
+        else:
+            continue
 
-            label_dict[patient, session] = label
-            print(f"Loaded {len(label_dict)} (patient, session) labels.")
+        label_dict[patient, session] = label
+        print(f"Loaded {len(label_dict)} (patient, session) labels.")
 
-            #####
-            left = sum(1 for v in label_dict.values() if v == 0)
-            right = sum(1 for v in label_dict.values() if v == 1)
-            print(f"  Left: {left}, Right: {right}")
-            return label_dict
+        #####
+        left = sum(1 for v in label_dict.values() if v == 0)
+        right = sum(1 for v in label_dict.values() if v == 1)
+        print(f"  Left: {left}, Right: {right}")
+        return label_dict
 
 
 class EEGDataset(Dataset):
