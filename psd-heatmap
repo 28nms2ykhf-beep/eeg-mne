@@ -3,33 +3,31 @@ import glob
 import mne
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg')  
 import matplotlib.pyplot as plt
 from scipy.signal import welch
+from scipy.interpolate import griddata
 from mne.channels import make_standard_montage
-from mne.channels import find_layout
 
 
-PATIENT_IDS = ["150013786"]
-SESSIONS_TO_PROCESS = ["ses-5"]
-BASE_PATH = "/home/sv25/Desktop/eeg_files+annotations"
-OUTPUT_BASE_DIR = "/home/sv25/Desktop/eeg_heatmaps_output"
+PATIENT_IDS = ["150013786"] 
+SESSIONS_TO_PROCESS = ["ses-5"]  
+BASE_PATH = "/home/sv25/Desktop/eeg_files+annotations"  
+OUTPUT_BASE_DIR = "/home/sv25/Desktop/eeg_heatmaps_output" 
 
 
-L_FREQ = 0.3
-H_FREQ = 70
-NOTCH_FREQ = 60
-TARGET_SFREQ = 256
+L_FREQ = 0.3      
+H_FREQ = 70        
+NOTCH_FREQ = 60    
 
+FMIN = 1.0        
+FMAX = 45.0     
+BANDWIDTH = 2.0   
+WINDOW_SEC = 4.0   
+OVERLAP = 0.5     
 
-FMIN = 1.0
-FMAX = 45.0
-BANDWIDTH = 2.0
-WINDOW_SEC = 4.0
-OVERLAP = 0.5
-
-GRID_SIZE = (64, 64)
-INTERPOLATION = 'cubic'
+GRID_SIZE = (64, 64)  
+INTERPOLATION = 'cubic'  
 
 def create_longitudinal_bipolar_montage(raw):
     bipolar_pairs = [
@@ -99,27 +97,13 @@ def get_bipolar_electrode_positions():
         needed_electrodes.add(ch2)
 
     coords_xy = {}
-    all_x = []
-    all_y = []
     for ch in needed_electrodes:
         if ch in pos_dict:
-            x, y, z = pos_dict[ch]  
+            x, y, z = pos_dict[ch]
             coords_xy[ch] = np.array([x, y])
-            all_x.append(x)
-            all_y.append(y)
         else:
             print(f"Warning: electrode {ch} not found in standard montage")
             coords_xy[ch] = np.array([0.0, 0.0])
-
-    if all_x and all_y:
-        min_x, max_x = min(all_x), max(all_x)
-        min_y, max_y = min(all_y), max(all_y)
-        range_x = max_x - min_x if max_x > min_x else 1.0
-        range_y = max_y - min_y if max_y > min_y else 1.0
-        for ch in coords_xy:
-            x_norm = (coords_xy[ch][0] - min_x) / range_x
-            y_norm = (coords_xy[ch][1] - min_y) / range_y
-            coords_xy[ch] = np.array([x_norm, y_norm])
 
     bipolar_pos = {}
     for ch1, ch2, bipolar_name in pairs:
@@ -127,12 +111,24 @@ def get_bipolar_electrode_positions():
             mid = (coords_xy[ch1] + coords_xy[ch2]) / 2
             bipolar_pos[bipolar_name] = mid
         else:
-            bipolar_pos[bipolar_name] = np.array([0.5, 0.5])
+            bipolar_pos[bipolar_name] = np.array([0.0, 0.0])
+
+    all_x = [pos[0] for pos in bipolar_pos.values()]
+    all_y = [pos[1] for pos in bipolar_pos.values()]
+    if all_x and all_y:
+        min_x, max_x = min(all_x), max(all_x)
+        min_y, max_y = min(all_y), max(all_y)
+        range_x = max_x - min_x if max_x > min_x else 1.0
+        range_y = max_y - min_y if max_y > min_y else 1.0
+        scale = max(range_x, range_y)
+        for name in bipolar_pos:
+            x_norm = (bipolar_pos[name][0] - (min_x + max_x)/2) / scale
+            y_norm = (bipolar_pos[name][1] - (min_y + max_y)/2) / scale
+            bipolar_pos[name] = np.array([x_norm, y_norm])
+
     return bipolar_pos
 
-
 def compute_band_powers(raw, fmin, fmax, bandwidth, window_sec=4.0, overlap=0.5):
-
     data = raw.get_data()  # (n_channels, n_times)
     sfreq = raw.info['sfreq']
     nperseg = int(window_sec * sfreq)
@@ -159,35 +155,34 @@ def compute_band_powers(raw, fmin, fmax, bandwidth, window_sec=4.0, overlap=0.5)
 
     return bands, band_powers, freqs, psd
 
-
 def generate_topomap(band_power_values, ch_names, bipolar_pos, grid_size=(64,64), freq_band_name='', output_image=None):
-    from scipy.interpolate import griddata
-
     valid_points = []
     valid_values = []
     for ch_name, val in zip(ch_names, band_power_values):
         if ch_name in bipolar_pos:
             valid_points.append(bipolar_pos[ch_name])
             valid_values.append(val)
-    if not valid_points:
+    if len(valid_points) < 3:
         return np.zeros(grid_size)
 
     points = np.array(valid_points)      # (n_valid, 2)
     values = np.array(valid_values)      # (n_valid,)
 
-    xi = np.linspace(0, 1, grid_size[1])
-    yi = np.linspace(0, 1, grid_size[0])
+    xi = np.linspace(-0.6, 0.6, grid_size[1])
+    yi = np.linspace(-0.6, 0.6, grid_size[0])
     xi, yi = np.meshgrid(xi, yi)
     grid_x, grid_y = xi, yi
 
-    heatmap = griddata(points, values, (grid_x, grid_y), method=INTERPOLATION, fill_value=0)
+    heatmap = griddata(points, values, (grid_x, grid_y), method=INTERPOLATION, fill_value=np.nan)
 
     if output_image:
         plt.figure(figsize=(6,5))
-        plt.imshow(heatmap, origin='lower', extent=[0,1,0,1], cmap='RdBu_r')
+        plt.imshow(heatmap, origin='lower', extent=[-0.6, 0.6, -0.6, 0.6], cmap='RdBu_r', aspect='auto')
         plt.colorbar(label='Power')
         plt.title(f'Band: {freq_band_name} Hz')
-        plt.axis('off')
+        circle = plt.Circle((0, 0), 0.5, color='k', fill=False, linestyle='--')
+        plt.gca().add_patch(circle)
+        plt.axis('equal')
         plt.tight_layout()
         plt.savefig(output_image, dpi=150, bbox_inches='tight')
         plt.close()
@@ -220,12 +215,10 @@ def process_session(patient_id, session, edf_path, output_dir):
 
     bipolar_pos = get_bipolar_electrode_positions()
 
-    heatmaps = []
+    heatmaps = [] 
     for i, (low, high) in enumerate(bands):
         band_name = f"{low:.1f}-{high:.1f}"
-        powers = band_powers[:, i]
-
-        # img_path = os.path.join(output_dir, f"heatmap_{band_name}.png")
+        powers = band_powers[:, i]  
         heatmap = generate_topomap(
             powers, ch_names, bipolar_pos,
             grid_size=GRID_SIZE, freq_band_name=band_name,
@@ -242,12 +235,17 @@ def process_session(patient_id, session, edf_path, output_dir):
     np.save(output_file, heatmap_stack)
     print(f"Saved heatmap stack to {output_file}")
 
+    ch_pos = bipolar_pos 
+    montage = mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame='head')
+    info = mne.create_info(ch_names=list(ch_pos.keys()), sfreq=raw_bipolar.info['sfreq'], ch_types='eeg')
+    info.set_montage(montage)
+
     fig, axes = plt.subplots(3, 4, figsize=(12, 9))
     axes = axes.flatten()
     for i in range(min(12, n_bands)):
-        im = axes[i].imshow(heatmaps[i], origin='lower', cmap='RdBu_r')
-        axes[i].set_title(f"{bands[i][0]:.1f}-{bands[i][1]:.1f} Hz")
-        axes[i].axis('off')
+        ax = axes[i]
+        im, cn = mne.viz.plot_topomap(band_powers[:, i], info, axes=ax, show=False, cmap='RdBu_r')
+        ax.set_title(f"{bands[i][0]:.1f}-{bands[i][1]:.1f} Hz")
     for j in range(i+1, 12):
         axes[j].axis('off')
     plt.suptitle(f"{patient_id} {session} - Band Power Topomaps")
@@ -259,14 +257,12 @@ def process_session(patient_id, session, edf_path, output_dir):
 
     return True
 
-
 def find_edf_file(base_path, patient_id, session):
     eeg_folder = os.path.join(base_path, patient_id, session, "eeg")
     if not os.path.exists(eeg_folder):
         return None
     edf_files = glob.glob(os.path.join(eeg_folder, "*.edf"))
     return edf_files[0] if edf_files else None
-
 
 def batch_process_heatmaps():
     print("="*60)
