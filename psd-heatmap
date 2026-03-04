@@ -3,33 +3,37 @@ import glob
 import mne
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  
+matplotlib.use('Agg')  # For headless environments
 import matplotlib.pyplot as plt
 from scipy.signal import welch
 from scipy.interpolate import griddata
 from mne.channels import make_standard_montage
 
+# ==================== Configuration ====================
+PATIENT_IDS = ["150013786"]  # List of patient IDs
+SESSIONS_TO_PROCESS = ["ses-5"]  # Sessions to process
+BASE_PATH = "/home/sv25/Desktop/eeg_files+annotations"  # Root directory of EDF files
+OUTPUT_BASE_DIR = "/home/sv25/Desktop/eeg_heatmaps_output"  # Output directory for heatmaps
 
-PATIENT_IDS = ["150013786"] 
-SESSIONS_TO_PROCESS = ["ses-5"]  
-BASE_PATH = "/home/sv25/Desktop/eeg_files+annotations"  
-OUTPUT_BASE_DIR = "/home/sv25/Desktop/eeg_heatmaps_output" 
+# Preprocessing parameters
+L_FREQ = 0.3       # High-pass filter
+H_FREQ = 70        # Low-pass filter
+NOTCH_FREQ = 60    # Notch filter
 
+# PSD parameters
+FMIN = 1.0         # Start frequency (Hz)
+FMAX = 45.0        # End frequency (Hz)
+BANDWIDTH = 2.0    # Bandwidth per heatmap (Hz)
+WINDOW_SEC = 4.0   # Window length for Welch (seconds)
+OVERLAP = 0.5      # Overlap ratio
 
-L_FREQ = 0.3      
-H_FREQ = 70        
-NOTCH_FREQ = 60    
+# Topomap parameters
+GRID_SIZE = (64, 64)  # Resolution for interpolation (not used for final image)
+INTERPOLATION = 'cubic'
 
-FMIN = 1.0        
-FMAX = 45.0     
-BANDWIDTH = 2.0   
-WINDOW_SEC = 4.0   
-OVERLAP = 0.5     
-
-GRID_SIZE = (64, 64)  
-INTERPOLATION = 'cubic'  
-
+# ==================== Helper: Build bipolar montage ====================
 def create_longitudinal_bipolar_montage(raw):
+    """Create longitudinal bipolar montage (18 channels)."""
     bipolar_pairs = [
         ('Fp1', 'F7', 'Fp1-F7'),
         ('F7', 'T3', 'F7-T3'),
@@ -65,10 +69,14 @@ def create_longitudinal_bipolar_montage(raw):
         bipolar_raw.set_meas_date(raw.info['meas_date'])
     return bipolar_raw
 
-
+# ==================== Get 2D positions for bipolar channels ====================
 def get_bipolar_electrode_positions():
+    """
+    Compute approximate 2D positions for each bipolar channel (midpoint of electrode pair).
+    Returns a dict {ch_name: (x, y)} with coordinates normalized to [-0.5, 0.5].
+    """
     montage = make_standard_montage('standard_1020')
-    pos_dict = montage.get_positions()['ch_pos']  # {ch_name: (x,y,z) in meters}
+    pos_dict = montage.get_positions()['ch_pos']  # 3D positions in meters
 
     pairs = [
         ('Fp1', 'F7', 'Fp1-F7'),
@@ -91,45 +99,54 @@ def get_bipolar_electrode_positions():
         ('Cz', 'Pz', 'Cz-Pz'),
     ]
 
-    needed_electrodes = set()
+    # Get (x, y) for each electrode (ignore z)
+    electrode_xy = {}
+    needed = set()
     for ch1, ch2, _ in pairs:
-        needed_electrodes.add(ch1)
-        needed_electrodes.add(ch2)
-
-    coords_xy = {}
-    for ch in needed_electrodes:
+        needed.add(ch1)
+        needed.add(ch2)
+    for ch in needed:
         if ch in pos_dict:
-            x, y, z = pos_dict[ch]
-            coords_xy[ch] = np.array([x, y])
+            electrode_xy[ch] = pos_dict[ch][:2]  # (x, y)
         else:
-            print(f"Warning: electrode {ch} not found in standard montage")
-            coords_xy[ch] = np.array([0.0, 0.0])
+            print(f"Warning: electrode {ch} not found, using (0,0)")
+            electrode_xy[ch] = np.array([0.0, 0.0])
 
+    # Compute midpoint for each bipolar channel
     bipolar_pos = {}
     for ch1, ch2, bipolar_name in pairs:
-        if ch1 in coords_xy and ch2 in coords_xy:
-            mid = (coords_xy[ch1] + coords_xy[ch2]) / 2
+        if ch1 in electrode_xy and ch2 in electrode_xy:
+            mid = (electrode_xy[ch1] + electrode_xy[ch2]) / 2
             bipolar_pos[bipolar_name] = mid
         else:
             bipolar_pos[bipolar_name] = np.array([0.0, 0.0])
 
+    # Normalize coordinates to [-0.5, 0.5] for better visualization
     all_x = [pos[0] for pos in bipolar_pos.values()]
     all_y = [pos[1] for pos in bipolar_pos.values()]
     if all_x and all_y:
         min_x, max_x = min(all_x), max(all_x)
         min_y, max_y = min(all_y), max(all_y)
-        range_x = max_x - min_x if max_x > min_x else 1.0
-        range_y = max_y - min_y if max_y > min_y else 1.0
-        scale = max(range_x, range_y)
+        scale = max(max_x - min_x, max_y - min_y)
+        if scale == 0:
+            scale = 1.0
         for name in bipolar_pos:
-            x_norm = (bipolar_pos[name][0] - (min_x + max_x)/2) / scale
-            y_norm = (bipolar_pos[name][1] - (min_y + max_y)/2) / scale
+            x_norm = (bipolar_pos[name][0] - (min_x + max_x) / 2) / scale
+            y_norm = (bipolar_pos[name][1] - (min_y + max_y) / 2) / scale
             bipolar_pos[name] = np.array([x_norm, y_norm])
-
     return bipolar_pos
 
+# ==================== Compute PSD and band powers ====================
 def compute_band_powers(raw, fmin, fmax, bandwidth, window_sec=4.0, overlap=0.5):
-    data = raw.get_data()  # (n_channels, n_times)
+    """
+    Compute PSD and average power per frequency band.
+    Returns:
+        bands: list of (low, high) tuples
+        band_powers: (n_channels, n_bands) array
+        freqs: frequency array
+        psd: (n_channels, n_freqs) array
+    """
+    data = raw.get_data()
     sfreq = raw.info['sfreq']
     nperseg = int(window_sec * sfreq)
     noverlap = int(nperseg * overlap)
@@ -142,70 +159,66 @@ def compute_band_powers(raw, fmin, fmax, bandwidth, window_sec=4.0, overlap=0.5)
         if freqs is None:
             freqs = f
         psd_list.append(pxx)
-    psd = np.array(psd_list)  # (n_channels, n_freqs)
+    psd = np.array(psd_list)
 
     band_edges = np.arange(fmin, fmax + bandwidth, bandwidth)
     bands = [(band_edges[i], band_edges[i+1]) for i in range(len(band_edges)-1)]
-
     n_bands = len(bands)
     band_powers = np.zeros((n_channels, n_bands))
     for i, (low, high) in enumerate(bands):
         mask = (freqs >= low) & (freqs < high)
         band_powers[:, i] = np.mean(psd[:, mask], axis=1)
-
     return bands, band_powers, freqs, psd
 
-def generate_topomap(band_power_values, ch_names, bipolar_pos, grid_size=(64,64), freq_band_name='', output_image=None):
-    valid_points = []
-    valid_values = []
-    for ch_name, val in zip(ch_names, band_power_values):
-        if ch_name in bipolar_pos:
-            valid_points.append(bipolar_pos[ch_name])
-            valid_values.append(val)
-    if len(valid_points) < 3:
-        return np.zeros(grid_size)
+# ==================== Generate and save individual topomap images ====================
+def save_topomap_image(values, ch_names, bipolar_pos, freq_band_name, output_path):
+    """
+    Create a topomap image using MNE's plot_topomap and save to output_path.
+    """
+    # Create a temporary info object with the bipolar channel positions
+    ch_pos = {name: bipolar_pos[name] for name in ch_names if name in bipolar_pos}
+    if len(ch_pos) < 3:
+        print(f"Not enough channels for topomap: {len(ch_pos)}")
+        return
+    montage = mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame='head')
+    info = mne.create_info(list(ch_pos.keys()), sfreq=256, ch_types='eeg')
+    info.set_montage(montage)
 
-    points = np.array(valid_points)      # (n_valid, 2)
-    values = np.array(valid_values)      # (n_valid,)
+    # Filter values to match channels present in ch_pos
+    valid_indices = [i for i, name in enumerate(ch_names) if name in ch_pos]
+    valid_values = values[valid_indices]
 
-    xi = np.linspace(-0.6, 0.6, grid_size[1])
-    yi = np.linspace(-0.6, 0.6, grid_size[0])
-    xi, yi = np.meshgrid(xi, yi)
-    grid_x, grid_y = xi, yi
+    # Plot and save
+    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+    mne.viz.plot_topomap(valid_values, info, axes=ax, show=False, cmap='RdBu_r',
+                         contours=0, outlines='head')
+    ax.set_title(f'Band: {freq_band_name} Hz')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved topomap: {output_path}")
 
-    heatmap = griddata(points, values, (grid_x, grid_y), method=INTERPOLATION, fill_value=np.nan)
-
-    if output_image:
-        plt.figure(figsize=(6,5))
-        plt.imshow(heatmap, origin='lower', extent=[-0.6, 0.6, -0.6, 0.6], cmap='RdBu_r', aspect='auto')
-        plt.colorbar(label='Power')
-        plt.title(f'Band: {freq_band_name} Hz')
-        circle = plt.Circle((0, 0), 0.5, color='k', fill=False, linestyle='--')
-        plt.gca().add_patch(circle)
-        plt.axis('equal')
-        plt.tight_layout()
-        plt.savefig(output_image, dpi=150, bbox_inches='tight')
-        plt.close()
-
-    return heatmap
-
-
+# ==================== Process a single session ====================
 def process_session(patient_id, session, edf_path, output_dir):
     print(f"\n--- Processing {patient_id} {session} ---")
     print(f"EDF: {edf_path}")
 
+    # 1. Load raw data
     raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
     print(f"Original sampling rate: {raw.info['sfreq']} Hz")
     print(f"Duration: {raw.times[-1]:.2f} s")
 
+    # 2. Apply filters
     raw.filter(L_FREQ, H_FREQ, verbose=False)
     raw.notch_filter(NOTCH_FREQ, verbose=False)
     print("Filtering done.")
 
+    # 3. Create bipolar montage
     raw_bipolar = create_longitudinal_bipolar_montage(raw)
     ch_names = raw_bipolar.ch_names
     print(f"Bipolar channels: {ch_names}")
 
+    # 4. Compute band powers
     bands, band_powers, freqs, psd = compute_band_powers(
         raw_bipolar, FMIN, FMAX, BANDWIDTH,
         window_sec=WINDOW_SEC, overlap=OVERLAP
@@ -213,50 +226,58 @@ def process_session(patient_id, session, edf_path, output_dir):
     n_bands = len(bands)
     print(f"Computed {n_bands} bands: {bands}")
 
+    # 5. Get bipolar channel positions
     bipolar_pos = get_bipolar_electrode_positions()
 
-    heatmaps = [] 
+    # 6. For each band, save a topomap image and also collect heatmap array for .npy
+    heatmaps = []
     for i, (low, high) in enumerate(bands):
         band_name = f"{low:.1f}-{high:.1f}"
-        powers = band_powers[:, i]  
-        heatmap = generate_topomap(
-            powers, ch_names, bipolar_pos,
-            grid_size=GRID_SIZE, freq_band_name=band_name,
-            output_image=None
-        )
+        powers = band_powers[:, i]
+
+        # Save image
+        img_filename = f"topomap_{i:02d}_{band_name}Hz.png"
+        img_path = os.path.join(output_dir, img_filename)
+        save_topomap_image(powers, ch_names, bipolar_pos, band_name, img_path)
+
+        # Also generate heatmap array (for .npy) using simple interpolation
+        # (optional, if you want to keep the .npy file)
+        # We'll use the same method as before but skip for brevity; you can add it if needed.
+        # For now, we'll just append zeros to keep the stack consistent.
+        # Actually, to generate the .npy we need the interpolated grid. Let's keep it simple:
+        # We'll create a grid and interpolate as before, but not save images.
+        valid_points = []
+        valid_vals = []
+        for ch_name, val in zip(ch_names, powers):
+            if ch_name in bipolar_pos:
+                valid_points.append(bipolar_pos[ch_name])
+                valid_vals.append(val)
+        if len(valid_points) >= 3:
+            points = np.array(valid_points)
+            values = np.array(valid_vals)
+            xi = np.linspace(-0.6, 0.6, GRID_SIZE[1])
+            yi = np.linspace(-0.6, 0.6, GRID_SIZE[0])
+            xi, yi = np.meshgrid(xi, yi)
+            heatmap = griddata(points, values, (xi, yi), method=INTERPOLATION, fill_value=0)
+        else:
+            heatmap = np.zeros(GRID_SIZE)
         heatmaps.append(heatmap)
 
         if (i+1) % 5 == 0:
-            print(f"  Generated heatmap for band {band_name}")
+            print(f"  Processed band {i+1}/{n_bands}")
 
-    heatmap_stack = np.stack(heatmaps, axis=0)  # (n_bands, 64, 64)
+    # 7. Save heatmap stack as .npy (optional, for training)
+    heatmap_stack = np.stack(heatmaps, axis=0)  # (n_bands, H, W)
+    npy_file = os.path.join(output_dir, f"heatmaps_{patient_id}_{session}.npy")
+    np.save(npy_file, heatmap_stack)
+    print(f"Saved heatmap stack to {npy_file}")
 
-    output_file = os.path.join(output_dir, f"heatmaps_{patient_id}_{session}.npy")
-    np.save(output_file, heatmap_stack)
-    print(f"Saved heatmap stack to {output_file}")
-
-    ch_pos = bipolar_pos 
-    montage = mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame='head')
-    info = mne.create_info(ch_names=list(ch_pos.keys()), sfreq=raw_bipolar.info['sfreq'], ch_types='eeg')
-    info.set_montage(montage)
-
-    fig, axes = plt.subplots(3, 4, figsize=(12, 9))
-    axes = axes.flatten()
-    for i in range(min(12, n_bands)):
-        ax = axes[i]
-        im, cn = mne.viz.plot_topomap(band_powers[:, i], info, axes=ax, show=False, cmap='RdBu_r')
-        ax.set_title(f"{bands[i][0]:.1f}-{bands[i][1]:.1f} Hz")
-    for j in range(i+1, 12):
-        axes[j].axis('off')
-    plt.suptitle(f"{patient_id} {session} - Band Power Topomaps")
-    plt.tight_layout()
-    summary_img = os.path.join(output_dir, f"summary_{patient_id}_{session}.png")
-    plt.savefig(summary_img, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Saved summary image to {summary_img}")
+    # 8. (Optional) Also create a summary figure with multiple topomaps
+    # We can use MNE to plot a grid, but user mainly wants individual images, so skip to keep simple.
 
     return True
 
+# ==================== Find EDF file ====================
 def find_edf_file(base_path, patient_id, session):
     eeg_folder = os.path.join(base_path, patient_id, session, "eeg")
     if not os.path.exists(eeg_folder):
@@ -264,6 +285,7 @@ def find_edf_file(base_path, patient_id, session):
     edf_files = glob.glob(os.path.join(eeg_folder, "*.edf"))
     return edf_files[0] if edf_files else None
 
+# ==================== Main batch processing ====================
 def batch_process_heatmaps():
     print("="*60)
     print("Starting EEG Heatmap Generation")
