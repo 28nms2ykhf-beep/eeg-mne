@@ -9,6 +9,8 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
     train_correct = 0
     train_total = 0
 
+    train_loader.dataset.reset_fill_counter()
+
     for batch in tqdm(train_loader, desc="Training", leave=False):
         if batch is None:
             continue
@@ -29,6 +31,9 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
 
     avg_loss = train_loss / len(train_loader)
     acc = 100.0 * train_correct / train_total
+
+    filled = train_loader.dataset.get_fill_count()
+    print(f"Epoch fill stats: {filled} samples had NaN/Inf were forward-filled")
     return avg_loss, acc
 
 
