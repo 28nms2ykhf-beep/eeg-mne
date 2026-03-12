@@ -43,6 +43,8 @@ class EEGDataset(Dataset):
         self.allowed_keys = set(allowed_keys) if allowed_keys else None
         self.samples = []
         self._collect_samples()
+        self.filled_count = 0
+        self.total_samples_checked = 0
 
     def _collect_samples(self):
         patients_found = 0
@@ -73,31 +75,88 @@ class EEGDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
+    
+    def forward_fill(self, eeg):
+        """forward padding for all the NaN and Inf value in the tensor"""
+        eeg = torch.where(torch.isinf(eeg), torch.tensor(float('nan'), device = eeg.device), eeg)
+        filled_this_sample = False
+
+        if eeg.dim == 3 and eeg.size(0) == 1:
+            eeg = eeg.squeeze(0)
+            squeezed = True
+        else:
+            squeezed = False
+
+        C, T =eeg.shape
+        for c in range(c):
+            channel = eeg[c]
+            nan_mask = torch.isnan(channel)
+            if nan_mask.any():
+                valid_idx = torch.where(~nan_mask)[0]
+                if len(valid_idx) == 0:
+                    channel[:] = 0.0
+                else:
+                    last_valid = valid_idx[0].item()
+                    for t in range(T):
+                        if nan_mask[t]:
+                            channel[t] == channel[last_valid]
+                        else:
+                            last_valid = t
+            
+            if squeezed:
+                eeg = eeg.unsqueeze(0)
+
+            if filled_this_sample:
+                self.filled_count += 1
+
+            return eeg
+        
 
     def __getitem__(self, idx):
         fpath, label, patient, session = self.samples[idx]
         try:
             eeg = torch.load(fpath).float()
+            
+            eeg = self.forward_fill(eeg)
+        
+            # Handle 2D: (18, 4096) or (4096, 18)
             if eeg.dim() == 2:
-                if eeg.shape[0] == 18:
+                if eeg.shape[0] == 18 and eeg.shape[1] == 4096:
                     eeg = eeg.unsqueeze(0)
-                elif eeg.shape[1] == 18:
-                    eeg = eeg.transpose(0, 1).unsqueeze(0)
-                elif eeg.numel() == 18 * 4096:
-                    eeg = eeg.view(1, 18, 4096)
+                elif eeg.shape[0] == 4096 and eeg.shape[1] == 18:
+                    eeg = eeg.t().unsqueeze(0)
                 else:
-                    raise ValueError(f"tensor shape {eeg.shape} invalid")
+                    if eeg.numel == 18 * 4096:
+                        eeg = eeg.view(1, 18, 4096)
+                    else:
+                        raise ValueError(f"Invalid 2D shape: {eeg.shape}")
+                
+            # Handle 3D: (1, 18, 4096) or (1, 4096, 18)
             elif eeg.dim() == 3:
-                if eeg.shape[2] == 18:
+                if eeg.shape[0] == 1 and eeg.shape[1] == 18 and eeg.shape[2] == 4096:
+                    pass
+                elif eeg.shape[0] == 1 and eeg.shape[1] == 4096 and eeg.shape[2] == 18:
                     eeg = eeg.transpose(1, 2)
-                if eeg.shape[0] != 1:
-                    eeg = eeg[:1]
+                elif eeg.shape[1] == 18 and eeg.shape[2] == 4096:
+                    eeg = eeg.unsqueeze(0) if eeg.shape[0] != 1 else eeg
+                else:
+                    raise ValueError(f"Unexpected 3D shape: {eeg.shape}")
             else:
-                raise ValueError(f"Dimension {eeg.dim()} invalid")
+                raise ValueError(f"Invalid dimension: {eeg.dim()}")
+
             return eeg, label, patient, session
+
         except Exception as e:
             print(f"Error loading {fpath}: {e}")
+            # Return a dummy tensor and placeholder values
             return torch.zeros(1, 18, 4096), -1, patient, session
+    
+    def reset_fill_counter(self):
+        self.filled_count = 0
+    
+    def get_filled_count(self):
+        return self.filled_count
+
 
 
 def collate_fn(batch):
