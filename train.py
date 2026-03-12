@@ -69,7 +69,7 @@ def test(model, test_loader, device):
             if batch is None:
                 continue
             eegs, labels, _, _ = batch
-            eegs = eegs.squeeze(1).to(device)
+            eegs = eegs.to(device)
             labels = labels.to(device)
 
             outputs = model(eegs)
