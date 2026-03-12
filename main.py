@@ -63,10 +63,10 @@ def main():
         F2=config.F2,
         D=config.D,
         num_classes=config.NUM_CLASSES,
-        kernal1=config.KERNEL_1,
-        kernal2=config.KERNEL_2,
+        kernel_1=config.KERNEL_1,   
+        kernel_2=config.KERNEL_2,  
         dropout=config.DROPOUT
-    ).to(config.DEVICE)
+    )
 
     print("model structure:", model)
 
