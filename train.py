@@ -13,7 +13,7 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
         if batch is None:
             continue
         eegs, labels, _, _ = batch
-        eegs = eegs.squeeze(1).to(device) 
+        eegs = eegs.to(device) 
         labels = labels.to(device)
 
         optimizer.zero_grad()
@@ -43,7 +43,7 @@ def validate(model, val_loader, criterion, device):
             if batch is None:
                 continue
             eegs, labels, _, _ = batch
-            eegs = eegs.squeeze(1).to(device)
+            eegs = eegs.to(device)
             labels = labels.to(device)
 
             outputs = model(eegs)
