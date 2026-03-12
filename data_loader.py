@@ -77,39 +77,34 @@ class EEGDataset(Dataset):
         return len(self.samples)
     
     def forward_fill(self, eeg):
-        """forward padding for all the NaN and Inf value in the tensor"""
-        eeg = torch.where(torch.isinf(eeg), torch.tensor(float('nan'), device = eeg.device), eeg)
-        filled_this_sample = False
+        eeg = torch.where(torch.isinf(eeg), torch.tensor(float('nan'), device=eeg.device), eeg)
 
-        if eeg.dim == 3 and eeg.size(0) == 1:
-            eeg = eeg.squeeze(0)
-            squeezed = True
-        else:
-            squeezed = False
+        orig_shape = eeg.shape
+        T = orig_shape[-1]                
+        C = eeg.numel() // T                
+        eeg_2d = eeg.view(C, T)            
 
-        C, T =eeg.shape
-        for c in range(c):
-            channel = eeg[c]
+        filled = False
+        for c in range(C):
+            channel = eeg_2d[c]
             nan_mask = torch.isnan(channel)
             if nan_mask.any():
+                filled = True
                 valid_idx = torch.where(~nan_mask)[0]
-                if len(valid_idx) == 0:
+                if len(valid_idx) == 0:    
                     channel[:] = 0.0
                 else:
                     last_valid = valid_idx[0].item()
                     for t in range(T):
                         if nan_mask[t]:
-                            channel[t] == channel[last_valid]
+                            channel[t] = channel[last_valid]
                         else:
                             last_valid = t
-            
-            if squeezed:
-                eeg = eeg.unsqueeze(0)
 
-            if filled_this_sample:
-                self.filled_count += 1
+        if filled:
+            self.filled_count += 1         
 
-            return eeg
+        return eeg_2d.view(orig_shape)     
         
 
     def __getitem__(self, idx):
