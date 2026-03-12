@@ -1,3 +1,4 @@
+# config.py
 import torch
 
 DATA_ROOT = "/home/sv25/Desktop/eeg_epochs_output"
