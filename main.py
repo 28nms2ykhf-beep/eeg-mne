@@ -50,9 +50,9 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE,
                               shuffle=True, collate_fn=collate_fn, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE,
-                            shuffle=False, collate_fn=collate_fn, drop_last=True)
+                            shuffle=False, collate_fn=collate_fn, drop_last=False)
     test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE,
-                             shuffle=False, collate_fn=collate_fn, drop_last=True)
+                             shuffle=False, collate_fn=collate_fn, drop_last=False)
 
   
     # create model
@@ -67,12 +67,13 @@ def main():
         kernel_2=config.KERNEL_2,  
         dropout=config.DROPOUT
     )
+    model = model.to(config.DEVICE)
 
     print("model structure:", model)
 
   
     # loss function and optimiser
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(),
                                   lr=config.LEARNING_RATE,
                                   weight_decay=config.WEIGHT_DECAY)
