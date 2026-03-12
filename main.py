@@ -42,7 +42,7 @@ def main():
     print(f"Test dataset size: {len(test_dataset)}")
 
     if len(train_dataset) == 0:
-        print("训练集为空，退出")
+        print("training is empty, exit")
         return
 
   
@@ -113,7 +113,7 @@ def main():
     # test best model
     model.load_state_dict(torch.load("best_model.pth"))
     test_acc = test(model, test_loader, config.DEVICE)
-    print(f"\n测试准确率: {test_acc:.2f}%")
+    print(f"\ntest acc: {test_acc:.2f}%")
 
   
     # plotting training cureve
