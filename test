@@ -1,7 +1,7 @@
 def build_augmented_samples(base_samples, seizure_target, num_augmented, seed=42):
     """
     生成扩展的样本列表，包含原始样本、复制的seizure样本和增强样本。
-    base_samples: list of (fpath, label, patient, session)  原始训练样本
+    base_samples: list of (fpath, label, patient, session, is_seizure)
     seizure_target: 目标seizure样本总数（包括原始seizure数量）
     num_augmented: 需要生成的增强样本数量
     """
@@ -10,32 +10,30 @@ def build_augmented_samples(base_samples, seizure_target, num_augmented, seed=42
     torch.manual_seed(seed)
 
     # 分离seizure和非seizure样本
-    seizure_samples = [s for s in base_samples if s[1] == 1]   # 标签1为seizure
-    non_seizure_samples = [s for s in base_samples if s[1] == 0]
+    seizure_samples = [s for s in base_samples if s[4] == 1]
     n_seizure = len(seizure_samples)
     n_duplicate = max(0, seizure_target - n_seizure)
 
-    # 1. 复制seizure样本（不增强）
+    # 1. 复制seizure样本（无增强）
     duplicated_seizure = []
     if n_duplicate > 0 and n_seizure > 0:
         choices = random.choices(seizure_samples, k=n_duplicate)   # 有放回复制
-        duplicated_seizure = [(fpath, label, patient, session, None) for (fpath, label, patient, session) in choices]
-    elif n_seizure == 0 and n_duplicate > 0:
-        print("Warning: No seizure samples to duplicate!")
+        for sample in choices:
+            duplicated_seizure.append(sample[:5] + (None,))   # 添加 None 增强参数
 
-    # 2. 生成增强样本
+    # 2. 生成增强样本（从所有原始样本中抽取）
     augmented = []
     if num_augmented > 0:
-        total_original = len(base_samples)
+        total = len(base_samples)
         # 无放回抽样，若不足则改为有放回
-        if num_augmented <= total_original:
-            sampled_indices = random.sample(range(total_original), num_augmented)
+        if num_augmented <= total:
+            indices = random.sample(range(total), num_augmented)
         else:
-            sampled_indices = random.choices(range(total_original), k=num_augmented)
-            print(f"Warning: num_augmented ({num_augmented}) > total samples ({total_original}), using replacement.")
+            indices = random.choices(range(total), k=num_augmented)
+            print(f"Warning: num_augmented ({num_augmented}) > total samples ({total}), using replacement.")
 
-        for idx in sampled_indices:
-            fpath, label, patient, session = base_samples[idx]
+        for idx in indices:
+            sample = base_samples[idx]
             aug_type = random.choice(['noise', 'scale', 'crop'])
             if aug_type == 'noise':
                 aug_params = {'type': 'noise', 'std': 0.01}           # 固定噪声标准差
@@ -44,16 +42,16 @@ def build_augmented_samples(base_samples, seizure_target, num_augmented, seed=42
             else:  # crop
                 start = random.randint(1024, 2048)                   # 保证中心点被覆盖
                 aug_params = {'type': 'crop', 'start': start}
-            augmented.append((fpath, label, patient, session, aug_params))
+            augmented.append(sample[:5] + (aug_params,))
 
     # 原始样本也转为带 None 增强参数的格式
-    original_with_none = [(fpath, label, patient, session, None) for (fpath, label, patient, session) in base_samples]
+    original = [s[:5] + (None,) for s in base_samples]
 
     # 合并并打乱
-    all_samples = original_with_none + duplicated_seizure + augmented
+    all_samples = original + duplicated_seizure + augmented
     random.shuffle(all_samples)
 
-    print(f"Original samples: {len(original_with_none)}")
+    print(f"Original samples: {len(original)} (seizure: {n_seizure})")
     print(f"Duplicated seizure samples: {len(duplicated_seizure)} (target seizure total: {seizure_target})")
     print(f"Augmented samples: {len(augmented)}")
     print(f"Total training samples: {len(all_samples)}")
